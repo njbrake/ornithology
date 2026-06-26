@@ -23,6 +23,7 @@ struct rmodel {
     ornith_arch  a;
     otokenizer   tok;
     int          nthreads;
+    char        *name;   /* general.name, or NULL */
 };
 
 /* ---- KV metadata helpers ----------------------------------------------- */
@@ -47,6 +48,20 @@ static float kv_f32(const ogguf_loaded *l, const char *key, float def) {
         float v; memcpy(&v, e->payload, 4); return v;
     }
     return def;
+}
+/* A STRING KV payload is u64 length + bytes (the type tag is stored in vtype).
+ * Returns a malloc'd, NUL-terminated copy, or NULL if absent/not a string. */
+enum { GT_STR = 8 };
+static char *kv_str(const ogguf_loaded *l, const char *key) {
+    const ogguf_lkv *e = kv_find(l, key);
+    if (!e || e->vtype != GT_STR || e->payload_len < 8) return NULL;
+    uint64_t len; memcpy(&len, e->payload, 8);
+    if (len > e->payload_len - 8) return NULL;
+    char *s = malloc((size_t)len + 1);
+    if (!s) return NULL;
+    memcpy(s, e->payload + 8, (size_t)len);
+    s[len] = '\0';
+    return s;
 }
 
 /* ---- tensor lookup ----------------------------------------------------- */
@@ -379,16 +394,20 @@ ornith_status rmodel_load(const char *path, rmodel **out) {
 
     m->nthreads = (int)ncpus();
     if (m->nthreads > 64) m->nthreads = 64;
+    m->name = kv_str(&m->l, "general.name");
     *out = m;
     return ORNITH_OK;
 }
 
 void rmodel_free(rmodel *m) {
     if (!m) return;
+    free(m->name);
     otok_free(&m->tok);
     ogguf_loaded_free(&m->l);
     free(m);
 }
+
+const char *rmodel_name(const rmodel *m) { return m->name; }
 
 const ornith_arch *rmodel_arch(const rmodel *m) { return &m->a; }
 const otokenizer  *rmodel_tokenizer(const rmodel *m) { return &m->tok; }
@@ -428,5 +447,48 @@ ornith_status rmodel_generate(rmodel *m, const char *prompt, int n_predict,
     fprintf(out, "\n");
 
     free(ptoks); free(logits); rstate_free(s);
+    return ORNITH_OK;
+}
+
+ornith_status rmodel_generate_ids(rmodel *m,
+                                  const int32_t *prompt_ids, int n_prompt,
+                                  int n_predict,
+                                  const int32_t *stop_ids, int n_stop,
+                                  void (*on_token)(int32_t id, const char *piece,
+                                                   void *ud),
+                                  void *ud, int *out_finish) {
+    const ornith_arch *a = &m->a;
+    int V = a->vocab_size;
+    if (n_prompt <= 0) { ornith_set_error("empty prompt"); return ORNITH_ERR_FORMAT; }
+    if (n_predict < 0) n_predict = 0;
+
+    int cap = n_prompt + n_predict + 4;
+    rstate *s = rstate_new(a, cap);
+    if (!s) { ornith_set_error("oom"); return ORNITH_ERR_OOM; }
+    float *logits = malloc((size_t)V * sizeof(float));
+    if (!logits) { rstate_free(s); ornith_set_error("oom"); return ORNITH_ERR_OOM; }
+
+    /* prefill: only the last prompt token needs logits */
+    for (int i = 0; i < n_prompt; i++)
+        rforward_token(m, s, prompt_ids[i], (i == n_prompt - 1) ? logits : NULL);
+
+    int finish = 1;  /* default: hit the length cap */
+    char piece[512];
+    int32_t next = argmax_f(logits, V);
+    for (int step = 0; step < n_predict; step++) {
+        int stop = (next == a->eos_token_id);
+        for (int k = 0; !stop && k < n_stop; k++)
+            if (next == stop_ids[k]) stop = 1;
+        if (stop) { finish = 0; break; }
+
+        otok_detok_token(&m->tok, next, piece, sizeof(piece));
+        if (on_token) on_token(next, piece, ud);
+
+        rforward_token(m, s, next, logits);
+        next = argmax_f(logits, V);
+    }
+
+    if (out_finish) *out_finish = finish;
+    free(logits); rstate_free(s);
     return ORNITH_OK;
 }

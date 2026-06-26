@@ -31,4 +31,23 @@ const otokenizer  *rmodel_tokenizer(const rmodel *m);
 ornith_status rmodel_generate(rmodel *m, const char *prompt, int n_predict,
                               FILE *out);
 
+/* The model id: general.name from the GGUF if present, else NULL. */
+const char *rmodel_name(const rmodel *m);
+
+/* Token-level, stop-aware greedy generation for the server. Prefills
+ * `prompt_ids` (n_prompt of them), then greedily decodes up to `n_predict`
+ * tokens. For each produced token it invokes `on_token(id, piece, ud)` where
+ * `piece` is that token's detokenized bytes (NUL-terminated; empty for special
+ * tokens). Generation stops, WITHOUT emitting the token, when the next token is
+ * the GGUF eos id or appears in `stop_ids` (n_stop entries). `*out_finish` is
+ * set to 0 if it stopped on a stop/eos token, 1 if it hit the n_predict length
+ * cap. The old rmodel_generate keeps working unchanged. */
+ornith_status rmodel_generate_ids(rmodel *m,
+                                  const int32_t *prompt_ids, int n_prompt,
+                                  int n_predict,
+                                  const int32_t *stop_ids, int n_stop,
+                                  void (*on_token)(int32_t id, const char *piece,
+                                                   void *ud),
+                                  void *ud, int *out_finish);
+
 #endif /* ORNITH_RFORWARD_H */
