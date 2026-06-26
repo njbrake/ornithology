@@ -9,8 +9,8 @@ asymmetric expert quantization that fits the 397B flagship into ~110-130GB.
 > Status: **CPU engine works end-to-end.** It loads a real Ornith GGUF and
 > generates coherent text — the forward pass (hybrid linear/full attention + MoE,
 > exact qwen3.5 gating) is validated against llama.cpp (logits match to ~0.8%).
-> Includes a byte-level BPE tokenizer and on-the-fly dequant (k-quant decoders).
-> An OpenAI/Anthropic/Responses-compatible server is in progress. The
+> Includes a byte-level BPE tokenizer, on-the-fly dequant (k-quant decoders), and
+> an **OpenAI/Anthropic/Responses-compatible HTTP server** (`ornith serve`). The
 > **Metal/CUDA backends are still stubs** (kernels are the next milestone) and the
 > **397B path** needs the sub-2-bit asymmetric quant — so today's runnable targets
 > are the **9B and 35B on CPU**. See [ROADMAP.md](ROADMAP.md).
@@ -80,10 +80,11 @@ tools/download_model.sh 9b-gguf        # ~5.6GB  (or: 35b-gguf ~21GB)
 ./ornith run --prompt "The capital of France is" -n 32 \
     models/Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf
 
-# OpenAI / Anthropic / Responses compatible server (in progress; CPU-backed)
-# ./ornith serve --port 8080 models/Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf
-# curl -s localhost:8080/v1/chat/completions \
-#   -d '{"messages":[{"role":"user","content":"Say hi in one word."}]}'
+# OpenAI / Anthropic / Responses compatible server (CPU-backed)
+./ornith serve --port 8080 models/Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf
+curl -s localhost:8080/v1/chat/completions \
+  -d '{"messages":[{"role":"user","content":"Say hi in one word."}],"max_tokens":64}'
+# also: POST /v1/responses, POST /v1/messages, GET /v1/models, GET /health
 ```
 
 Expect CPU speed (a naive reference kernel; faster on a many-core Studio, but not
@@ -102,7 +103,7 @@ roughly the GGUF file size, not the f32 model.
 ./ornith inspect model.gguf           # parse GGUF header/metadata/tensor index
 ./ornith inspect --tensors model.gguf # also list every tensor
 ./ornith run --prompt "..." [-n N] model.gguf   # real-weight greedy generation (CPU)
-./ornith serve [--host H] [--port P] model.gguf # OpenAI/Anthropic/Responses server (in progress)
+./ornith serve [--host H] [--port P] model.gguf # OpenAI/Anthropic/Responses server
 ```
 
 `arch` prints a back-of-envelope memory model: parameter count, weight
@@ -121,9 +122,11 @@ src/
   ornith_gguf.*     GGUF v2/v3 reader (header, metadata, tensor index)
   ornith_json.*     tiny dependency-free JSON parser
   ornith_util.c     error handling
+  ornith_tokenizer.* byte-level BPE tokenizer (loaded from GGUF metadata)
+  ornith_rforward.*  real-weight forward + on-the-fly dequant generation
+  ornith_server.*   OpenAI/Anthropic/Responses HTTP server (CPU-backed)
   ornith_metal.m    Metal backend            (stub: kernels are the next milestone)
   ornith_cuda.cu    CUDA backend             (stub)
-  ornith_server.c   OpenAI/Anthropic HTTP API (stub)
   ornith_agent.c    integrated coding agent   (stub)
 tools/
   quantize/POLICY.md   the asymmetric quantization policy for the 397B GGUF
