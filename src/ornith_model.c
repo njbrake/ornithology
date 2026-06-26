@@ -17,6 +17,8 @@ void ornith_arch_defaults_397b(ornith_arch *a) {
     a->num_attn_heads    = 32;
     a->num_kv_heads      = 2;
     a->head_dim          = 256;
+    a->rope_dim          = 64;
+    a->attn_output_gate  = true;
     a->full_attn_interval= 4;
 
     a->lin_key_heads     = 16;
@@ -52,6 +54,8 @@ void ornith_arch_defaults_35b(ornith_arch *a) {
     a->num_attn_heads    = 16;
     a->num_kv_heads      = 2;
     a->head_dim          = 256;
+    a->rope_dim          = 64;
+    a->attn_output_gate  = true;
     a->full_attn_interval= 4;
 
     a->lin_key_heads     = 16;
