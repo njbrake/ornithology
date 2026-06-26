@@ -27,6 +27,8 @@
 #include "ornith_tokenizer.h"
 #include "ornith_server.h"
 #include "ornith_agent.h"
+#include "ornith_bench.h"
+#include "ornith_eval.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -561,11 +563,15 @@ static void usage(const char *argv0) {
         "  %s agent [--yolo] [--max-iters N] --task \"...\" <model.gguf>\n"
         "        coding-agent loop (read_file/write_file/list_dir/run_command);\n"
         "        write_file/run_command confirm via y/N unless --yolo\n"
+        "  %s bench [--prompt-len P] [--gen N] [--reps R] <model.gguf>\n"
+        "        measure load time, prefill/decode tok/s, and peak RSS\n"
+        "  %s eval <model.gguf> <corpus.txt> [--max-tokens N]\n"
+        "        compute perplexity (mean NLL / exp) over a text corpus\n"
         "\n"
         "quantize applies the asymmetric POLICY.md mapping; --base TYPE\n"
         "(f32|f16|bf16|q8_0|q4_0, default f16) covers tensors with no rule.\n",
         ORNITH_VERSION, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-        argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -663,6 +669,12 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(cmd, "agent")) {
         return ornith_agent_main(argc - 2, argv + 2);
+    }
+    if (!strcmp(cmd, "bench")) {
+        return ornith_bench_main(argc - 2, argv + 2);
+    }
+    if (!strcmp(cmd, "eval")) {
+        return ornith_eval_main(argc - 2, argv + 2);
     }
 
     usage(argv[0]);
