@@ -72,7 +72,7 @@ static void test_parse_chat(void) {
     ojson *r = parse("{\"messages\":[{\"role\":\"system\",\"content\":\"S\"},"
                      "{\"role\":\"user\",\"content\":\"hi\"}],"
                      "\"max_tokens\":42,\"stream\":true,\"temperature\":0.7}");
-    chat_msgs m; gen_opts o = {0,0};
+    chat_msgs m; gen_opts o = {0};
     const char *err = srv_parse_openai_chat(r, &m, &o);
     CHECK(err == NULL, "parse ok");
     CHECK(m.len == 2, "2 messages");
@@ -84,7 +84,7 @@ static void test_parse_chat(void) {
 
     /* missing messages -> error */
     ojson *r2 = parse("{\"max_tokens\":5}");
-    chat_msgs m2; gen_opts o2 = {0,0};
+    chat_msgs m2; gen_opts o2 = {0};
     const char *err2 = srv_parse_openai_chat(r2, &m2, &o2);
     CHECK(err2 != NULL, "missing messages -> error");
     CHECK(o2.max_tokens == 5, "default-applied max_tokens read");
@@ -93,7 +93,7 @@ static void test_parse_chat(void) {
     /* content as array of blocks collapses to text */
     ojson *r3 = parse("{\"messages\":[{\"role\":\"user\",\"content\":"
                       "[{\"type\":\"text\",\"text\":\"ab\"},{\"type\":\"text\",\"text\":\"cd\"}]}]}");
-    chat_msgs m3; gen_opts o3 = {0,0};
+    chat_msgs m3; gen_opts o3 = {0};
     srv_parse_openai_chat(r3, &m3, &o3);
     CHECK(m3.len == 1 && strcmp(m3.v[0].content, "abcd") == 0, "content blocks collapse to 'abcd'");
     CHECK(o3.max_tokens == 256, "default max_tokens 256");
@@ -104,7 +104,7 @@ static void test_parse_responses(void) {
     printf("== parse OpenAI responses ==\n");
     ojson *r = parse("{\"input\":\"hello\",\"instructions\":\"be brief\","
                      "\"max_output_tokens\":10}");
-    chat_msgs m; gen_opts o = {0,0};
+    chat_msgs m; gen_opts o = {0};
     const char *err = srv_parse_responses(r, &m, &o);
     CHECK(err == NULL, "parse ok");
     CHECK(m.len == 2, "instructions + input -> 2 messages");
@@ -117,7 +117,7 @@ static void test_parse_responses(void) {
 
     /* input as array of typed blocks */
     ojson *r2 = parse("{\"input\":[{\"type\":\"input_text\",\"text\":\"abc\"}]}");
-    chat_msgs m2; gen_opts o2 = {0,0};
+    chat_msgs m2; gen_opts o2 = {0};
     srv_parse_responses(r2, &m2, &o2);
     CHECK(m2.len == 1 && strcmp(m2.v[0].content, "abc") == 0, "input block -> 'abc'");
     chat_msgs_free(&m2); ojson_free(r2);
@@ -127,7 +127,7 @@ static void test_parse_anthropic(void) {
     printf("== parse Anthropic messages ==\n");
     ojson *r = parse("{\"model\":\"ornith\",\"max_tokens\":7,\"system\":\"sys\","
                      "\"messages\":[{\"role\":\"user\",\"content\":\"q\"}]}");
-    chat_msgs m; gen_opts o = {0,0};
+    chat_msgs m; gen_opts o = {0};
     const char *err = srv_parse_anthropic(r, &m, &o);
     CHECK(err == NULL, "parse ok");
     CHECK(m.len == 2, "system + user -> 2 messages");
@@ -139,7 +139,7 @@ static void test_parse_anthropic(void) {
     /* content as block array + system as block array */
     ojson *r2 = parse("{\"max_tokens\":5,\"system\":[{\"type\":\"text\",\"text\":\"S\"}],"
                       "\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"blk\"}]}]}");
-    chat_msgs m2; gen_opts o2 = {0,0};
+    chat_msgs m2; gen_opts o2 = {0};
     srv_parse_anthropic(r2, &m2, &o2);
     CHECK(m2.len == 2 && strcmp(m2.v[0].content, "S") == 0 && strcmp(m2.v[1].content, "blk") == 0,
           "block-array system + content collapse");
