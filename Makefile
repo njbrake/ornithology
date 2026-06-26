@@ -26,6 +26,8 @@ CORE := \
   $(SRC_DIR)/ornith_json.c \
   $(SRC_DIR)/ornith_config.c \
   $(SRC_DIR)/ornith_gguf.c \
+  $(SRC_DIR)/ornith_gguf_write.c \
+  $(SRC_DIR)/ornith_quant.c \
   $(SRC_DIR)/ornith_model.c
 
 CLI  := $(SRC_DIR)/ornith.c
@@ -72,6 +74,9 @@ test: $(CORE_OBJ)
 	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_gguf.c $(CORE_OBJ) \
 	  $(LIBS) -o $(BUILD)/test_gguf
 	./$(BUILD)/test_gguf
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_quant.c $(CORE_OBJ) \
+	  $(LIBS) -o $(BUILD)/test_quant
+	./$(BUILD)/test_quant
 
 clean:
 	rm -rf $(BUILD) ornith
