@@ -9,10 +9,15 @@
  * str = u64 len | bytes (no NUL). All scalars little-endian. Offsets are
  * relative to the start of the (aligned) data section.
  */
+#define _POSIX_C_SOURCE 200809L
 #include "ornith_gguf_write.h"
 #include "ornith_quant.h"
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 
 /* GGUF metadata value type tags (must match the reader). */
 enum {
@@ -419,29 +424,51 @@ ornith_status ogguf_load(const char *path, ogguf_loaded *out) {
                    ornith_set_error("ftell failed"); return ORNITH_ERR_IO; }
     uint64_t data_start = align_up((uint64_t)pos, out->alignment);
 
+    /* mmap the whole file read-only, so weights page in on demand instead of
+     * being malloc'd + read up front. The mapping outlives the fd. */
+    int fd = fileno(f);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        fclose(f); ogguf_loaded_free(out);
+        ornith_set_error("fstat failed for %s", path); return ORNITH_ERR_IO;
+    }
+    size_t fsize = (size_t)st.st_size;
+    if (data_start > fsize) {
+        fclose(f); ogguf_loaded_free(out);
+        ornith_set_error("data section starts past EOF in %s", path);
+        return ORNITH_ERR_FORMAT;
+    }
+    void *map = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) {
+        fclose(f); ogguf_loaded_free(out);
+        ornith_set_error("mmap failed for %s", path); return ORNITH_ERR_IO;
+    }
+    /* fd no longer needed; the mapping persists after close. */
+    fclose(f);
+    out->map = map;
+    out->map_size = fsize;
+
     for (uint64_t i = 0; i < out->n_tensors; i++) {
         ogguf_ltensor *t = &out->tensors[i];
         uint64_t offset = (uint64_t)(uintptr_t)t->data;
         t->data = NULL;
         t->nbytes = oq_row_bytes(t->type, t->n_elements);
         if (!t->nbytes && t->n_elements) {
-            fclose(f); ogguf_loaded_free(out);
+            ogguf_loaded_free(out);
             ornith_set_error("tensor '%s': cannot size type %s for load",
                              t->name, oggml_type_name(t->type));
             return ORNITH_ERR_UNSUPPORTED;
         }
-        t->data = malloc(t->nbytes ? t->nbytes : 1);
-        if (!t->data) { fclose(f); ogguf_loaded_free(out);
-                        ornith_set_error("oom (tensor data)"); return ORNITH_ERR_OOM; }
-        if (fseek(f, (long)(data_start + offset), SEEK_SET) != 0 ||
-            (t->nbytes && fread(t->data, 1, t->nbytes, f) != t->nbytes)) {
-            fclose(f); ogguf_loaded_free(out);
-            ornith_set_error("short read for tensor '%s' data", t->name);
-            return ORNITH_ERR_IO;
+        /* bounds-check before handing out a pointer into the mapping */
+        if (offset > fsize - data_start ||
+            t->nbytes > fsize - data_start - offset) {
+            ogguf_loaded_free(out);
+            ornith_set_error("tensor '%s' data extends past EOF", t->name);
+            return ORNITH_ERR_FORMAT;
         }
+        t->data = (uint8_t *)map + data_start + offset;
     }
 
-    fclose(f);
     return ORNITH_OK;
 }
 
@@ -454,10 +481,10 @@ void ogguf_loaded_free(ogguf_loaded *l) {
         }
         free(l->kv);
     }
-    if (l->tensors) {
-        for (uint64_t i = 0; i < l->n_tensors; i++) free(l->tensors[i].data);
-        free(l->tensors);
-    }
+    /* Tensor `data` pointers reference the mmap, not malloc'd buffers, so we
+     * must NOT free them individually — just release the array and the map. */
+    free(l->tensors);
+    if (l->map && l->map != MAP_FAILED) munmap(l->map, l->map_size);
     memset(l, 0, sizeof(*l));
 }
 
@@ -531,7 +558,12 @@ ornith_status ornith_quantize_file(const char *in_path, const char *out_path,
     s = ogguf_writer_write(w, out_path);
 
 done:
-    free(keep);
+    /* keep[] held the per-tensor output buffers alive (borrowed by the writer)
+     * until the file was written; release them now. */
+    if (keep) {
+        for (uint64_t i = 0; i < in.n_tensors; i++) free(keep[i]);
+        free(keep);
+    }
     ogguf_writer_free(w);
     ogguf_loaded_free(&in);
     return s;

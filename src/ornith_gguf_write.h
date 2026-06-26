@@ -68,7 +68,7 @@ typedef struct {
     uint64_t dims[OGGUF_MAX_DIMS];
     uint64_t n_elements;
     uint32_t type;
-    void    *data;      /* owned: oq-decodable bytes for this tensor          */
+    void    *data;      /* borrowed: points INTO the mmap (owned by ogguf_loaded.map) */
     uint64_t nbytes;
 } ogguf_ltensor;
 
@@ -86,6 +86,8 @@ typedef struct {
     uint64_t       n_kv;
     ogguf_ltensor *tensors;
     uint64_t       n_tensors;
+    void          *map;        /* mmap base for the whole file (tensor data lives here) */
+    size_t         map_size;   /* length passed to munmap                              */
 } ogguf_loaded;
 
 ornith_status ogguf_load(const char *path, ogguf_loaded *out);
