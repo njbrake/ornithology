@@ -4,6 +4,27 @@ Milestones in dependency order. The split is deliberate: everything that can be
 correct without a 397B checkpoint or a GPU is done first and tested, then the
 inference path is built bottom-up and gated on logit parity.
 
+## Current status (CPU stack feature-complete)
+
+**Done & tested on CPU:** GGUF reader/writer + mmap loading · HF config + arch
+(9B/35B/397B) · quant codecs F32/F16/BF16/Q8_0/Q4_0/Q2_K/Q4_K/Q5_K/Q6_K/IQ2_XXS
+(encode+decode) · imatrix importance-weighted quant · the full hybrid forward
+(linear delta-net + GQA + gated full attn + MoE routing), validated vs llama.cpp
+(~0.8%) · chunked prefill · quant-aware Q8 matvec (~3x) · Q8 KV-cache · sampling ·
+byte-level BPE tokenizer · OpenAI/Anthropic/Responses server with streaming +
+tool calling + web UI · integrated agent + REPL · persistent KV sessions ·
+bench + eval. 13 test suites green, `-Wall -Wextra` clean.
+
+**In progress:** Metal backend (M3) — first cut of the quant-aware matvec kernels
+written against the CPU oracle; compiles via `make metal` on Apple silicon but
+not yet on-device verified.
+
+**Not started (GPU/cluster half):** CUDA/ROCm backends, distributed inference,
+speculative decoding (MTP). SSD weight streaming is largely covered by mmap.
+
+The per-milestone checklists below predate this summary; treat the summary as
+authoritative for what's landed.
+
 ## M0 — scaffold (done)
 - [x] GGUF v2/v3 reader (header, metadata, tensor index)
 - [x] HF `config.json` parser -> `ornith_arch`

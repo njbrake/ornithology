@@ -6,14 +6,28 @@ DeepSeek V4. The goal: run **Ornith-1.0-397B** and **Ornith-1.0-35B** on a
 single high-memory machine (Apple silicon first, then CUDA), with a ds4-style
 asymmetric expert quantization that fits the 397B flagship into ~110-130GB.
 
-> Status: **CPU engine works end-to-end.** It loads a real Ornith GGUF and
-> generates coherent text — the forward pass (hybrid linear/full attention + MoE,
-> exact qwen3.5 gating) is validated against llama.cpp (logits match to ~0.8%).
-> Includes a byte-level BPE tokenizer, on-the-fly dequant (k-quant decoders), and
-> an **OpenAI/Anthropic/Responses-compatible HTTP server** (`ornith serve`). The
-> **Metal/CUDA backends are still stubs** (kernels are the next milestone) and the
-> **397B path** needs the sub-2-bit asymmetric quant — so today's runnable targets
-> are the **9B and 35B on CPU**. See [ROADMAP.md](ROADMAP.md).
+> Status: **the CPU stack is feature-complete and broadly at ds4 parity.** It
+> loads a real Ornith GGUF (dense 9B and MoE 35B) and generates coherent text;
+> the forward pass (hybrid linear/full attention + MoE, exact qwen3.5 gating) is
+> validated against llama.cpp (logits match to ~0.8%). Shipped on CPU:
+>
+> - byte-level BPE tokenizer; **mmap** weight loading (so the 397B's ~113GB never
+>   needs a single allocation); on-the-fly dequant
+> - quant codecs: F32/F16/BF16/Q8_0/Q4_0, k-quants **Q2_K/Q4_K/Q5_K/Q6_K**, and
+>   sub-2-bit **IQ2_XXS** — encode + decode; **imatrix** importance-weighted quant
+> - quant-aware **Q8 matvec** (the ds4-style integer dot; ~3x faster than f32),
+>   **Q8 KV-cache**, **sampling** (temp/top-p/top-k/min-p/repeat-penalty/seed)
+> - **OpenAI + Anthropic + OpenAI-Responses** HTTP server (`ornith serve`) with
+>   streaming, **tool/function calling** on all three, and a built-in web UI
+> - **integrated coding agent** (`ornith agent`, read/write/run tools with a
+>   confirm gate) + interactive **REPL** (`ornith repl`)
+> - **persistent KV sessions** (bit-exact save/resume), and **bench**/**eval**
+>   (tok/s, perplexity) harnesses
+>
+> Remaining for full parity is the **GPU half**: the Metal backend is a first cut
+> (compiles on Apple silicon via `make metal`; kernels mirror the CPU oracle but
+> are not yet verified on-device), and CUDA/ROCm, distributed inference, and
+> speculative decoding are not started. See [ROADMAP.md](ROADMAP.md).
 
 ## Why a new engine instead of forking ds4
 
@@ -102,8 +116,15 @@ roughly the GGUF file size, not the f32 model.
 ./ornith config path/to/config.json   # parse a HF config.json, validate it's qwen3_5_moe
 ./ornith inspect model.gguf           # parse GGUF header/metadata/tensor index
 ./ornith inspect --tensors model.gguf # also list every tensor
-./ornith run --prompt "..." [-n N] model.gguf   # real-weight greedy generation (CPU)
-./ornith serve [--host H] [--port P] model.gguf # OpenAI/Anthropic/Responses server
+./ornith run --prompt "..." [-n N] [--temp T --top-p P --top-k K --seed S] \
+             [--kv-q8] [--session FILE] model.gguf   # real-weight generation (CPU)
+./ornith serve [--host H] [--port P] model.gguf # OpenAI/Anthropic/Responses server + web UI
+./ornith repl model.gguf                        # interactive multi-turn chat
+./ornith agent [--yolo] [--max-iters N] --task "..." model.gguf  # coding agent (tools)
+./ornith imatrix model.gguf corpus.txt -o imatrix.dat   # collect importance matrix
+./ornith quantize [--base TYPE] [--imatrix imatrix.dat] in.gguf out.gguf
+./ornith bench [--prompt-len P] [--gen N] model.gguf    # prefill/decode tok/s + RSS
+./ornith eval model.gguf corpus.txt                     # perplexity
 ```
 
 `arch` prints a back-of-envelope memory model: parameter count, weight
