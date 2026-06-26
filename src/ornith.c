@@ -21,6 +21,7 @@
 #include "ornith_gguf_write.h"
 #include "ornith_quant.h"
 #include "ornith_forward.h"
+#include "ornith_rforward.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -281,6 +282,29 @@ static int cmd_run(const char *path) {
     return run_synthetic_selftest();
 }
 
+/* Real-weight generation: load the GGUF, dequantize on the fly, and greedily
+ * decode `n_predict` tokens after the prompt. This is the coherent-text path. */
+static int cmd_generate(const char *path, const char *prompt, int n_predict) {
+    rmodel *m = NULL;
+    ornith_status s = rmodel_load(path, &m);
+    if (s != ORNITH_OK) {
+        fprintf(stderr, "run: load failed: %s\n", ornith_last_error());
+        return 1;
+    }
+    const ornith_arch *a = rmodel_arch(m);
+    fprintf(stderr,
+            "loaded %s: hidden %d, %d layers (%d full-attn), vocab %d, "
+            "eos %d\n", path, a->hidden_size, a->num_layers,
+            ornith_count_full_attn_layers(a), a->vocab_size, a->eos_token_id);
+    fprintf(stderr, "generating %d tokens (greedy)...\n\n", n_predict);
+
+    s = rmodel_generate(m, prompt, n_predict, stdout);
+    if (s != ORNITH_OK)
+        fprintf(stderr, "run: generation failed: %s\n", ornith_last_error());
+    rmodel_free(m);
+    return s == ORNITH_OK ? 0 : 1;
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
         "ornithology %s\n\n"
@@ -290,7 +314,9 @@ static void usage(const char *argv0) {
         "  %s config <config.json>\n"
         "  %s inspect [--tensors] <model.gguf>\n"
         "  %s quantize [--base TYPE] <in.gguf> <out.gguf>\n"
-        "  %s run <model.gguf>            (loads GGUF; runs the M2 forward engine)\n"
+        "  %s run [--prompt TEXT] [-n N] <model.gguf>\n"
+        "        with --prompt: real-weight greedy generation (default N=32);\n"
+        "        without: inspect + dequant check + synthetic self-test\n"
         "\n"
         "quantize applies the asymmetric POLICY.md mapping; --base TYPE\n"
         "(f32|f16|bf16|q8_0|q4_0, default f16) covers tensors with no rule.\n",
@@ -336,8 +362,17 @@ int main(int argc, char **argv) {
         return cmd_quantize(paths[0], paths[1], base);
     }
     if (!strcmp(cmd, "run")) {
-        if (argc < 3) { usage(argv[0]); return 1; }
-        return cmd_run(argv[2]);
+        const char *path = NULL, *prompt = NULL;
+        int n_predict = 32;
+        for (int i = 2; i < argc; i++) {
+            if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
+            else if ((!strcmp(argv[i], "-n") || !strcmp(argv[i], "--n-predict"))
+                     && i + 1 < argc) n_predict = atoi(argv[++i]);
+            else path = argv[i];
+        }
+        if (!path) { usage(argv[0]); return 1; }
+        if (prompt) return cmd_generate(path, prompt, n_predict);
+        return cmd_run(path);   /* no prompt: inspect + synthetic self-test */
     }
 
     usage(argv[0]);

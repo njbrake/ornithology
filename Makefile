@@ -14,8 +14,9 @@
 CC      ?= cc
 CSTD    ?= -std=c11
 CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter $(CSTD)
+CFLAGS  += -pthread
 LDFLAGS ?=
-LIBS    ?= -lm
+LIBS    ?= -lm -pthread
 
 SRC_DIR := src
 BUILD   := build
@@ -32,6 +33,8 @@ CORE := \
   $(SRC_DIR)/ornith_tensor.c \
   $(SRC_DIR)/ornith_attn.c \
   $(SRC_DIR)/ornith_moe.c \
+  $(SRC_DIR)/ornith_tokenizer.c \
+  $(SRC_DIR)/ornith_rforward.c \
   $(SRC_DIR)/ornith_forward.c
 
 CLI  := $(SRC_DIR)/ornith.c
@@ -76,7 +79,8 @@ cuda-spark: $(CORE_OBJ) $(CLI)
 # Test suite (CPU only). Each test file is its own binary; all must pass.
 # GOLDEN_TOP_TOKEN pins the tiny-model regression output (see test_forward.c).
 GOLDEN_TOP_TOKEN ?= 9
-TESTS := test_gguf test_quant test_tensor test_attn test_moe test_forward
+TESTS := test_gguf test_quant test_tensor test_attn test_moe test_forward \
+         test_tokenizer
 
 test: $(CORE_OBJ)
 	@set -e; for t in $(TESTS); do \

@@ -83,6 +83,28 @@ int main(void) {
               "rope pos 0 = identity");
     }
 
+    printf("== tensor: softplus ==\n");
+    {
+        /* softplus(0)=ln2; large x -> ~x; stable (no overflow) at x=100 */
+        CHECK(close(ot_softplus(0.0f), 0.6931472f, 1e-5f), "softplus(0)=ln2");
+        CHECK(close(ot_softplus(100.0f), 100.0f, 1e-3f), "softplus(100)~100 (stable)");
+        CHECK(ot_softplus(-100.0f) >= 0.0f && ot_softplus(-100.0f) < 1e-3f,
+              "softplus(-100)~0");
+    }
+
+    printf("== tensor: l2norm_eps ==\n");
+    {
+        float x[4] = {3,4,0,0}, y[4];
+        ot_l2norm_eps(x, y, 4, 0.0f);   /* ||x||=5 -> unit */
+        CHECK(close(y[0],0.6f,1e-5f) && close(y[1],0.8f,1e-5f),
+              "l2norm_eps normalizes [3,4]->[0.6,0.8]");
+        CHECK(close(ot_dot(y,y,4), 1.0f, 1e-5f), "l2norm_eps yields unit vector");
+        /* eps regularizes a near-zero vector toward 0 rather than exploding */
+        float z[2] = {1e-4f, 0.0f}, zo[2];
+        ot_l2norm_eps(z, zo, 2, 1e-6f);
+        CHECK(zo[0] < 1.0f, "l2norm_eps with eps damps a tiny vector");
+    }
+
     printf("== tensor: rng determinism ==\n");
     {
         ot_rng a = ot_rng_seed(123), b = ot_rng_seed(123);
