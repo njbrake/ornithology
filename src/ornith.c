@@ -67,10 +67,14 @@ static int cmd_inspect(const char *path, bool list_tensors) {
     }
     ogguf_print(&g, stdout, list_tensors);
 
-    bool ok = strstr(g.model_arch, "qwen3_5") != NULL ||
+    /* Real Ornith GGUFs report general.architecture "qwen35" (dense 9B) or
+     * "qwen35moe" (35B/397B); also accept the HF-style string and the ssm/expert
+     * tensor signatures of the hybrid layout. */
+    bool ok = strstr(g.model_arch, "qwen35") != NULL ||
+              strstr(g.model_arch, "qwen3_5") != NULL ||
               strstr(g.model_arch, "ornith") != NULL ||
               g.n_expert_tensors > 0;
-    printf("\nlooks like an Ornith/MoE GGUF: %s\n", ok ? "yes" : "unclear");
+    printf("\nlooks like an Ornith GGUF: %s\n", ok ? "yes" : "unclear");
     ogguf_close(&g);
     return 0;
 }
