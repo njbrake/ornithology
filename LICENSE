@@ -1,6 +1,16 @@
 MIT License
 
-Copyright (c) 2026 Nathan Brake and ornithology contributors
+Copyright (c) 2026 The ornithology authors
+Copyright (c) 2023-2026 The ggml authors
+Copyright (c) 2026 The ds4.c authors
+
+ornithology reuses GGUF container conventions and ggml-compatible quantization
+block layouts (e.g. Q8_0, Q4_0, Q4_K, Q6_K) from the llama.cpp / ggml project,
+which is MIT licensed; the ggml authors' copyright notice above is included for
+that attribution, mirroring the practice of the antirez/ds4 project. The HTTP
+server (src/ornith_server.c) is adapted from antirez/ds4 (ds4_server.c), also
+MIT licensed; the ds4.c authors' copyright notice above is included for that
+attribution.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

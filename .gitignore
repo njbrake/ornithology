@@ -12,6 +12,10 @@
 *.dat
 imatrix*
 
+# python
+__pycache__/
+*.pyc
+
 # editor / OS
 .DS_Store
 *.swp

@@ -36,6 +36,8 @@ typedef struct {
     int32_t num_attn_heads;    /* 32                                          */
     int32_t num_kv_heads;      /* 2                                           */
     int32_t head_dim;          /* 256                                         */
+    int32_t rope_dim;          /* rotary dims per head (partial rope); 0=full */
+    bool    attn_output_gate;  /* full-attn out gate (attn_q packs q+gate)    */
     int32_t full_attn_interval;/* 4  -> 1 full attn layer per 4 layers        */
 
     /* linear-attention layers (gated delta-net) */
