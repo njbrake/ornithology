@@ -6,11 +6,14 @@ DeepSeek V4. The goal: run **Ornith-1.0-397B** and **Ornith-1.0-35B** on a
 single high-memory machine (Apple silicon first, then CUDA), with a ds4-style
 asymmetric expert quantization that fits the 397B flagship into ~110-130GB.
 
-> Status: **early scaffold.** The model-introspection tooling
-> (`inspect`/`config`/`arch`) works and is tested. The inference forward pass
-> (the hybrid linear/full attention + MoE engine) is the next milestone and is
-> currently stubbed with honest "not implemented" errors. See
-> [ROADMAP.md](ROADMAP.md).
+> Status: **CPU engine works end-to-end.** It loads a real Ornith GGUF and
+> generates coherent text — the forward pass (hybrid linear/full attention + MoE,
+> exact qwen3.5 gating) is validated against llama.cpp (logits match to ~0.8%).
+> Includes a byte-level BPE tokenizer, on-the-fly dequant (k-quant decoders), and
+> an OpenAI/Anthropic/Responses-compatible server. The **Metal/CUDA backends are
+> still stubs** (kernels are the next milestone) and the **397B path** needs the
+> sub-2-bit asymmetric quant — so today's runnable targets are the **9B and 35B
+> on CPU**. See [ROADMAP.md](ROADMAP.md).
 
 ## Why a new engine instead of forking ds4
 
@@ -60,6 +63,35 @@ make cuda       # generic Linux CUDA
 make cuda-spark # DGX Spark / GB10
 ```
 
+## Quickstart on a Mac (CPU today)
+
+The CPU engine is real and generates coherent text from real Ornith GGUFs. Metal
+is the primary *target* but its kernels are still stubs, so **build the default
+(CPU) target for now** — `make metal` is not functional yet (see ROADMAP M3).
+
+```sh
+make                                   # CPU build -> ./ornith  (NOT `make metal` yet)
+
+# get a model (no weights are committed). The dense 9B is the smallest;
+# the 35B is the smallest MoE and fits a 128GB Mac comfortably.
+tools/download_model.sh 9b-gguf        # ~5.6GB  (or: 35b-gguf ~21GB)
+
+# one-shot generation
+./ornith run --prompt "The capital of France is" -n 32 \
+    models/Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf
+
+# OpenAI / Anthropic / Responses compatible server (CPU-backed here)
+./ornith serve --port 8080 models/Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf
+curl -s localhost:8080/v1/chat/completions \
+  -d '{"messages":[{"role":"user","content":"Say hi in one word."}]}'
+```
+
+Expect CPU speed (a naive reference kernel; faster on a many-core Studio, but not
+GPU-fast). The **397B does not run yet** — it needs the sub-2-bit asymmetric quant
+*and* the Metal backend. On a 128GB Studio the **35B** is the model to try today.
+Weights stay quantized in RAM and are dequantized on the fly, so peak memory is
+roughly the GGUF file size, not the f32 model.
+
 ## Usage (today)
 
 ```sh
@@ -69,7 +101,8 @@ make cuda-spark # DGX Spark / GB10
 ./ornith config path/to/config.json   # parse a HF config.json, validate it's qwen3_5_moe
 ./ornith inspect model.gguf           # parse GGUF header/metadata/tensor index
 ./ornith inspect --tensors model.gguf # also list every tensor
-./ornith run model.gguf               # NOT IMPLEMENTED YET (forward pass is M2/M3)
+./ornith run --prompt "..." [-n N] model.gguf   # real-weight greedy generation (CPU)
+./ornith serve [--host H] [--port P] model.gguf # OpenAI/Anthropic/Responses server
 ```
 
 `arch` prints a back-of-envelope memory model: parameter count, weight
