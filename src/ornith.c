@@ -14,6 +14,7 @@
  * 397B checkpoint or a Metal/CUDA device works now and is covered by tests; the
  * quantized-weight binding is gated with a clear message rather than faked.
  */
+#define _POSIX_C_SOURCE 200112L   /* setenv (used by --kv-q8) under -std=c11 */
 #include "ornith.h"
 #include "ornith_model.h"
 #include "ornith_config.h"
@@ -325,7 +326,7 @@ static void usage(const char *argv0) {
         "  %s inspect [--tensors] <model.gguf>\n"
         "  %s quantize [--base TYPE] <in.gguf> <out.gguf>\n"
         "  %s run [--prompt TEXT] [-n N] [--temp T] [--top-p P] [--top-k K]\n"
-        "         [--min-p M] [--repeat-penalty R] [--seed S] <model.gguf>\n"
+        "         [--min-p M] [--repeat-penalty R] [--seed S] [--kv-q8] <model.gguf>\n"
         "        with --prompt: real-weight generation (default N=32);\n"
         "        default greedy (--temp 0); --temp>0 enables sampling;\n"
         "        without --prompt: inspect + dequant check + synthetic self-test\n"
@@ -395,6 +396,9 @@ int main(int argc, char **argv) {
                 sp.repeat_penalty = (float)atof(argv[++i]);
             else if (!strcmp(argv[i], "--seed") && i + 1 < argc)
                 sp.seed = (uint64_t)strtoull(argv[++i], NULL, 10);
+            else if (!strcmp(argv[i], "--kv-q8"))
+                /* int8 + per-(token,head) scale KV cache (see ORNITH_KV_Q8). */
+                setenv("ORNITH_KV_Q8", "1", 1);
             else path = argv[i];
         }
         if (!path) { usage(argv[0]); return 1; }

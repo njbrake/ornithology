@@ -9,11 +9,34 @@
 /*  Full GQA causal attention                                              */
 /* ======================================================================= */
 
-ornith_status ornith_kv_init(ornith_kv_cache *c, int capacity,
-                             int n_kv_heads, int head_dim) {
+size_t ornith_kv_bytes_per_token(int n_kv_heads, int head_dim, int quantized) {
+    size_t hv = (size_t)n_kv_heads * head_dim;
+    if (quantized)
+        /* K + V: int8 codes (1 byte each) + one f32 scale per head, x2 (K,V). */
+        return 2 * (hv * sizeof(int8_t) + (size_t)n_kv_heads * sizeof(float));
+    return 2 * hv * sizeof(float);   /* K + V, fp32 */
+}
+
+ornith_status ornith_kv_init_ex(ornith_kv_cache *c, int capacity,
+                                int n_kv_heads, int head_dim, int quantized) {
     memset(c, 0, sizeof(*c));
     c->capacity = capacity; c->n_kv_heads = n_kv_heads; c->head_dim = head_dim;
-    size_t per = (size_t)capacity * n_kv_heads * head_dim;
+    c->quantized = quantized ? 1 : 0;
+    size_t per   = (size_t)capacity * n_kv_heads * head_dim;
+    size_t scl   = (size_t)capacity * n_kv_heads;
+    if (c->quantized) {
+        c->Kq = calloc(per, sizeof(int8_t));
+        c->Vq = calloc(per, sizeof(int8_t));
+        c->Ks = calloc(scl, sizeof(float));
+        c->Vs = calloc(scl, sizeof(float));
+        if (!c->Kq || !c->Vq || !c->Ks || !c->Vs) {
+            free(c->Kq); free(c->Vq); free(c->Ks); free(c->Vs);
+            memset(c, 0, sizeof(*c));
+            ornith_set_error("kv cache (q8) oom (capacity %d)", capacity);
+            return ORNITH_ERR_OOM;
+        }
+        return ORNITH_OK;
+    }
     c->K = calloc(per, sizeof(float));
     c->V = calloc(per, sizeof(float));
     if (!c->K || !c->V) {
@@ -24,11 +47,42 @@ ornith_status ornith_kv_init(ornith_kv_cache *c, int capacity,
     return ORNITH_OK;
 }
 
+ornith_status ornith_kv_init(ornith_kv_cache *c, int capacity,
+                             int n_kv_heads, int head_dim) {
+    return ornith_kv_init_ex(c, capacity, n_kv_heads, head_dim, 0);
+}
+
 void ornith_kv_free(ornith_kv_cache *c) {
     if (!c) return;
-    free(c->K); free(c->V); memset(c, 0, sizeof(*c));
+    free(c->K); free(c->V); free(c->Kq); free(c->Vq); free(c->Ks); free(c->Vs);
+    memset(c, 0, sizeof(*c));
 }
 void ornith_kv_reset(ornith_kv_cache *c) { c->len = 0; }
+
+/* Symmetric per-vector int8 quantize of `x` [n]: scale = amax/127, code =
+ * round(x/scale) clamped to [-127,127]. Returns the scale (0 for an all-zero
+ * vector, in which case all codes are 0). */
+static float kv_quant_vec(const float *x, int n, int8_t *q) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
+    if (amax == 0.0f) { memset(q, 0, (size_t)n * sizeof(int8_t)); return 0.0f; }
+    float scale = amax / 127.0f, inv = 127.0f / amax;
+    for (int i = 0; i < n; i++) {
+        int v = (int)lrintf(x[i] * inv);
+        if (v >  127) v =  127;
+        if (v < -127) v = -127;
+        q[i] = (int8_t)v;
+    }
+    return scale;
+}
+
+/* dot(q_f32, dequant(code, scale)) = scale * sum(q_i * code_i). */
+static float kv_dot_q8(const float *qf, const int8_t *code, float scale, int n) {
+    if (scale == 0.0f) return 0.0f;
+    float acc = 0.0f;
+    for (int i = 0; i < n; i++) acc += qf[i] * (float)code[i];
+    return acc * scale;
+}
 
 void ornith_gqa_step(ornith_kv_cache *c, const float *q,
                      const float *k_new, const float *v_new,
@@ -37,10 +91,22 @@ void ornith_gqa_step(ornith_kv_cache *c, const float *q,
     if (scale <= 0.0f) scale = 1.0f / sqrtf((float)hd);
     if (c->len >= c->capacity) return; /* caller guarantees capacity */
 
-    /* append new K,V at position len */
     int pos = c->len;
-    memcpy(c->K + (size_t)pos * nkv * hd, k_new, (size_t)nkv * hd * sizeof(float));
-    memcpy(c->V + (size_t)pos * nkv * hd, v_new, (size_t)nkv * hd * sizeof(float));
+    if (c->quantized) {
+        /* append: quantize each head's K,V head-vector to int8 + scale */
+        for (int h = 0; h < nkv; h++) {
+            size_t off = (size_t)pos * nkv + h;
+            c->Ks[off] = kv_quant_vec(k_new + (size_t)h * hd, hd,
+                                      c->Kq + off * hd);
+            c->Vs[off] = kv_quant_vec(v_new + (size_t)h * hd, hd,
+                                      c->Vq + off * hd);
+        }
+    } else {
+        memcpy(c->K + (size_t)pos * nkv * hd, k_new,
+               (size_t)nkv * hd * sizeof(float));
+        memcpy(c->V + (size_t)pos * nkv * hd, v_new,
+               (size_t)nkv * hd * sizeof(float));
+    }
     c->len++;
 
     int T = c->len;
@@ -49,16 +115,34 @@ void ornith_gqa_step(ornith_kv_cache *c, const float *q,
     for (int h = 0; h < n_heads; h++) {
         int kvh = h / group;
         const float *qh = q + (size_t)h * hd;
-        for (int t = 0; t < T; t++) {
-            const float *kt = c->K + ((size_t)t * nkv + kvh) * hd;
-            scores[t] = ot_dot(qh, kt, hd) * scale;
+        if (c->quantized) {
+            for (int t = 0; t < T; t++) {
+                size_t off = (size_t)t * nkv + kvh;
+                scores[t] = kv_dot_q8(qh, c->Kq + off * hd, c->Ks[off], hd) * scale;
+            }
+        } else {
+            for (int t = 0; t < T; t++) {
+                const float *kt = c->K + ((size_t)t * nkv + kvh) * hd;
+                scores[t] = ot_dot(qh, kt, hd) * scale;
+            }
         }
         ot_softmax(scores, T);
         float *oh = out + (size_t)h * hd;
         memset(oh, 0, (size_t)hd * sizeof(float));
-        for (int t = 0; t < T; t++) {
-            const float *vt = c->V + ((size_t)t * nkv + kvh) * hd;
-            ot_addscaled_(oh, vt, scores[t], hd);
+        if (c->quantized) {
+            for (int t = 0; t < T; t++) {
+                size_t off = (size_t)t * nkv + kvh;
+                /* oh += scores[t] * dequant(Vq) = (scores[t]*Vs) * code */
+                float sv = scores[t] * c->Vs[off];
+                if (sv == 0.0f) continue;
+                const int8_t *vt = c->Vq + off * hd;
+                for (int i = 0; i < hd; i++) oh[i] += sv * (float)vt[i];
+            }
+        } else {
+            for (int t = 0; t < T; t++) {
+                const float *vt = c->V + ((size_t)t * nkv + kvh) * hd;
+                ot_addscaled_(oh, vt, scores[t], hd);
+            }
         }
     }
     free(scores);

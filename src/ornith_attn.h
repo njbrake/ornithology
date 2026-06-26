@@ -36,18 +36,48 @@
 
 /* ---- full GQA causal attention ---------------------------------------- */
 
-/* Contiguous f32 KV cache for one full-attention layer. K and V are stored as
- * [capacity, n_kv_heads, head_dim] row-major; `len` grows as tokens append. */
+/* Contiguous KV cache for one full-attention layer.
+ *
+ * Two storage modes, selected at init (see `quantized`):
+ *
+ *   - fp32 (default): K and V are stored as [capacity, n_kv_heads, head_dim]
+ *     row-major in K/V; `len` grows as tokens append. Bit-for-bit the old path.
+ *
+ *   - int8 + per-(token,head) scale (Q8): each token's per-head K (and V)
+ *     head_dim-vector is symmetric-quantized to int8 with scale = amax/127.
+ *     Kq/Vq hold the int8 codes [capacity, n_kv_heads, head_dim]; Ks/Vs hold
+ *     the per-(token,head) f32 scales [capacity, n_kv_heads]. The attention dot
+ *     dequantizes on the fly (scores = scale_q * scale_k * sum(q_i * Kq_i)).
+ *     This roughly quarters KV-cache memory vs. fp32 (more than the
+ *     fp16->int8 "halving" baseline) at the cost of ~1e-2 rounding per dot.
+ *
+ * Only the full-attention layers hold a KV cache; the linear (gated-delta)
+ * layers keep their fp32 recurrent state and are unaffected by this mode.
+ */
 typedef struct {
-    float  *K, *V;
-    int     capacity;     /* max positions                                   */
-    int     len;          /* positions currently stored                      */
-    int     n_kv_heads;
-    int     head_dim;
+    /* fp32 storage (quantized == 0) */
+    float   *K, *V;       /* [capacity, n_kv_heads, head_dim]                 */
+    /* int8 + per-(token,head) scale storage (quantized == 1) */
+    int8_t  *Kq, *Vq;     /* [capacity, n_kv_heads, head_dim] int8 codes      */
+    float   *Ks, *Vs;     /* [capacity, n_kv_heads] per-head scales           */
+    int      quantized;   /* 0 = fp32 (default), 1 = int8 + scales            */
+    int      capacity;    /* max positions                                   */
+    int      len;         /* positions currently stored                      */
+    int      n_kv_heads;
+    int      head_dim;
 } ornith_kv_cache;
 
+/* fp32 KV cache (default, unchanged behavior). */
 ornith_status ornith_kv_init(ornith_kv_cache *c, int capacity,
                              int n_kv_heads, int head_dim);
+
+/* Like ornith_kv_init but `quantized != 0` selects the int8+scale KV store. */
+ornith_status ornith_kv_init_ex(ornith_kv_cache *c, int capacity,
+                                int n_kv_heads, int head_dim, int quantized);
+
+/* Bytes held by the KV cache per token (both K and V), for the given mode and
+ * geometry. fp32: 2*n_kv_heads*head_dim*4. Q8: 2*n_kv_heads*(head_dim + 4). */
+size_t ornith_kv_bytes_per_token(int n_kv_heads, int head_dim, int quantized);
 void          ornith_kv_free(ornith_kv_cache *c);
 void          ornith_kv_reset(ornith_kv_cache *c);
 

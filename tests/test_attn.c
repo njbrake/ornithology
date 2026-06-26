@@ -118,6 +118,45 @@ static void test_gqa(void) {
     free(Q); free(K); free(V); free(O_ref); free(O_step);
 }
 
+/* ---- full GQA: Q8 KV cache ~= fp32 reference (bounded error) ---------- */
+
+static void test_gqa_q8(void) {
+    printf("== full GQA: int8 KV cache ~= fp32 reference (bounded) ==\n");
+    int nh = 4, nkv = 2, hd = 16, T = 13;
+    int qd = nh*hd, kvd = nkv*hd;
+    ot_rng r = ot_rng_seed(123);
+    float *Q = malloc(T*qd*sizeof(float));
+    float *K = malloc(T*kvd*sizeof(float));
+    float *V = malloc(T*kvd*sizeof(float));
+    ot_rng_fill(&r, Q, T*qd, -1, 1);
+    ot_rng_fill(&r, K, T*kvd, -1, 1);
+    ot_rng_fill(&r, V, T*kvd, -1, 1);
+
+    float *O_ref = malloc(T*qd*sizeof(float));
+    ornith_gqa_reference(Q, K, V, T, nh, nkv, hd, O_ref, 0.0f);
+
+    ornith_kv_cache c; ornith_kv_init_ex(&c, T, nkv, hd, 1);  /* Q8 mode */
+    CHECK(c.quantized == 1 && c.K == NULL && c.Kq != NULL, "Q8 init: int8 store");
+    float *O_q8 = malloc(T*qd*sizeof(float));
+    for (int t=0;t<T;t++)
+        ornith_gqa_step(&c, Q+t*qd, K+t*kvd, V+t*kvd, nh, O_q8+t*qd, 0.0f);
+
+    float md = maxdiff(O_ref, O_q8, T*qd);
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Q8 vs fp32 reference: maxdiff=%.2e (< 5e-2)", md);
+    /* int8 KV introduces ~1e-2 rounding per dot; coherence-preserving, not exact. */
+    CHECK(md < 5e-2f, msg);
+    ornith_kv_free(&c);
+
+    /* memory math: Q8 KV must be well under half of fp32 KV per token. */
+    size_t b32 = ornith_kv_bytes_per_token(nkv, hd, 0);
+    size_t bq8 = ornith_kv_bytes_per_token(nkv, hd, 1);
+    snprintf(msg, sizeof(msg), "bytes/token fp32=%zu q8=%zu (q8 <= half)", b32, bq8);
+    CHECK(bq8 * 2 <= b32, msg);
+
+    free(Q); free(K); free(V); free(O_ref); free(O_q8);
+}
+
 /* ---- causal conv: prefill == steps, causality holds ------------------- */
 
 static void test_conv(void) {
@@ -155,6 +194,7 @@ static void test_conv(void) {
 int main(void) {
     test_delta_parity();
     test_gqa();
+    test_gqa_q8();
     test_conv();
     printf("\n%s (%d failure%s)\n",
            failures ? "ATTN TESTS FAILED" : "ALL ATTN TESTS PASSED",
