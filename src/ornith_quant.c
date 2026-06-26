@@ -246,6 +246,113 @@ static void put_scale_min_k4(uint8_t *q, const uint8_t *sc, const uint8_t *mn) {
     }
 }
 
+/* ---- importance-weighted scale fitting --------------------------------- *
+ * Shared by the k-quant encoders' imatrix path. The unweighted (RTN) encoders
+ * are left byte-for-byte unchanged so oq_quantize output (and its golden tests)
+ * never move; importance only steers scale/min selection on the new path. */
+
+static inline int nearest_int(float x) { return (int)lroundf(x); }
+
+/* Weighted affine sub-block fit (port of llama.cpp make_qkx2_quants).
+ * Model: x_i ~= scale*L_i - the_min, L_i in [0,nmax], minimizing sum w_i*err^2.
+ * Returns scale (>=0), writes the_min (>=0). L/Laux are scratch of length n. */
+static float make_qkx2_w(int n, int nmax, const float *x, const float *w,
+                         uint8_t *L, uint8_t *Laux, float *the_min) {
+    float min = x[0], max = x[0];
+    float sum_w = w[0], sum_x = w[0] * x[0];
+    for (int i = 1; i < n; i++) {
+        if (x[i] < min) min = x[i];
+        if (x[i] > max) max = x[i];
+        sum_w += w[i];
+        sum_x += w[i] * x[i];
+    }
+    if (min > 0) min = 0;
+    if (max == min) { for (int i = 0; i < n; i++) L[i] = 0; *the_min = -min; return 0.f; }
+
+    float iscale = nmax / (max - min);
+    float scale  = 1.f / iscale;
+    float best   = 0.f;
+    for (int i = 0; i < n; i++) {
+        int l = nearest_int(iscale * (x[i] - min));
+        l = l < 0 ? 0 : (l > nmax ? nmax : l);
+        L[i] = (uint8_t)l;
+        float diff = scale * (float)l + min - x[i];
+        best += w[i] * diff * diff;
+    }
+    /* sweep candidate scales; for each, refit (scale,min) by weighted least
+     * squares against the rounded levels and keep the lowest weighted error. */
+    const float rmin = -1.f, rdelta = 0.1f;
+    const int   nstep = 20;
+    for (int is = 0; is <= nstep; is++) {
+        float si = (rmin + rdelta * (float)is + (float)nmax) / (max - min);
+        float sl = 0, sl2 = 0, sxl = 0;
+        for (int i = 0; i < n; i++) {
+            int l = nearest_int(si * (x[i] - min));
+            l = l < 0 ? 0 : (l > nmax ? nmax : l);
+            Laux[i] = (uint8_t)l;
+            float fw = w[i], fl = (float)l;
+            sl += fw * fl; sl2 += fw * fl * fl; sxl += fw * fl * x[i];
+        }
+        float D = sum_w * sl2 - sl * sl;
+        if (D > 0) {
+            float this_scale = (sum_w * sxl - sum_x * sl) / D;
+            float this_min   = (sl2 * sum_x - sl * sxl) / D;
+            if (this_min > 0) { this_min = 0; this_scale = sl2 > 0 ? sxl / sl2 : 0; }
+            float mad = 0;
+            for (int i = 0; i < n; i++) {
+                float diff = this_scale * (float)Laux[i] + this_min - x[i];
+                mad += w[i] * diff * diff;
+            }
+            if (mad < best && this_scale >= 0) {
+                for (int i = 0; i < n; i++) L[i] = Laux[i];
+                best = mad; scale = this_scale; min = this_min;
+            }
+        }
+    }
+    *the_min = -min;
+    return scale < 0 ? 0 : scale;
+}
+
+/* Build a per-element weight vector from an importance slice (n elems). Floors
+ * to a small fraction of the block mean so all-zero/cold channels still get a
+ * sane (uniform) treatment instead of a degenerate fit. */
+static void build_weights(const float *imp, int n, float *w) {
+    if (!imp) { for (int i = 0; i < n; i++) w[i] = 1.f; return; }
+    float mean = 0.f;
+    for (int i = 0; i < n; i++) mean += imp[i];
+    mean = n ? mean / (float)n : 0.f;
+    float floor = mean > 0.f ? mean * 1e-3f : 0.f;
+    int any = 0;
+    for (int i = 0; i < n; i++) {
+        float v = imp[i] > floor ? imp[i] : floor;
+        w[i] = v;
+        if (v > 0.f) any = 1;
+    }
+    if (!any) for (int i = 0; i < n; i++) w[i] = 1.f;
+}
+
+/* Weighted symmetric scale for a Q6_K group: value = gs*(q-32), q in [0,63].
+ * Coordinate descent: round to levels, refit gs = sum(w*x*l)/sum(w*l*l). */
+static float make_q6_group_scale_w(const float *x, const float *w, int n) {
+    float amax = 0.f;
+    for (int i = 0; i < n; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
+    if (amax < 1e-30f) return 0.f;
+    float gs = amax / 32.f;
+    for (int it = 0; it < 4 && gs > 0.f; it++) {
+        float num = 0.f, den = 0.f;
+        for (int i = 0; i < n; i++) {
+            int q = nearest_int(x[i] / gs) + 32;
+            q = q < 0 ? 0 : (q > 63 ? 63 : q);
+            int l = q - 32;
+            num += w[i] * x[i] * (float)l;
+            den += w[i] * (float)l * (float)l;
+        }
+        if (den > 0.f) gs = num / den;
+        if (gs < 0.f) gs = -gs;
+    }
+    return gs;
+}
+
 static void dequantize_q2_K(const uint8_t *src, float *dst, size_t nblk) {
     for (size_t b = 0; b < nblk; b++) {
         const uint8_t *p = src + b * 84;
@@ -341,17 +448,24 @@ static void dequantize_q6_K(const uint8_t *src, float *dst, size_t nblk) {
 
 /* Q6_K encode (RTN): 16 groups of 16 share an int8 scale; superblock d scales
  * those. value = d * sc[group] * (q - 32), q in [0,63]. */
-static void quantize_q6_K(const float *src, uint8_t *dst, size_t nblk) {
+static void quantize_q6_K_core(const float *src, uint8_t *dst, size_t nblk,
+                               const float *imp) {
     for (size_t b = 0; b < nblk; b++) {
         const float *x = src + b * QK_K;
+        const float *xi = imp ? imp + b * QK_K : NULL;
         uint8_t *p = dst + b * 210;
         uint8_t *ql = p, *qh = p + 128;
         int8_t  *sc = (int8_t *)(p + 192);
         float gscale[16], maxs = 0.0f;
         for (int g = 0; g < 16; g++) {
-            float amax = 0.0f;
-            for (int l = 0; l < 16; l++) { float a = fabsf(x[g*16+l]); if (a > amax) amax = a; }
-            gscale[g] = amax / 32.0f;
+            if (xi) {
+                float w[16]; build_weights(xi + g*16, 16, w);
+                gscale[g] = make_q6_group_scale_w(x + g*16, w, 16);
+            } else {
+                float amax = 0.0f;
+                for (int l = 0; l < 16; l++) { float a = fabsf(x[g*16+l]); if (a > amax) amax = a; }
+                gscale[g] = amax / 32.0f;
+            }
             if (gscale[g] > maxs) maxs = gscale[g];
         }
         float d = maxs / 127.0f, id = d ? 1.0f / d : 0.0f;
@@ -384,16 +498,28 @@ static void quantize_q6_K(const float *src, uint8_t *dst, size_t nblk) {
         }
     }
 }
+static void quantize_q6_K(const float *src, uint8_t *dst, size_t nblk) {
+    quantize_q6_K_core(src, dst, nblk, NULL);
+}
 
 /* Q4_K encode (RTN): 8 sub-blocks of 32, each an affine (scale, min);
  * value = d*scale*q - dmin*min, q in [0,15]. */
-static void quantize_q4_K(const float *src, uint8_t *dst, size_t nblk) {
+static void quantize_q4_K_core(const float *src, uint8_t *dst, size_t nblk,
+                               const float *imp) {
     for (size_t b = 0; b < nblk; b++) {
         const float *x = src + b * QK_K;
+        const float *xi = imp ? imp + b * QK_K : NULL;
         uint8_t *p = dst + b * 144;
         float subscale[8], submin[8];
         for (int j = 0; j < 8; j++) {
             const float *xs = x + j*32;
+            if (xi) {
+                float w[32], tmin; uint8_t L[32], La[32];
+                build_weights(xi + j*32, 32, w);
+                subscale[j] = make_qkx2_w(32, 15, xs, w, L, La, &tmin);
+                submin[j]   = tmin;
+                continue;
+            }
             float lo = xs[0], hi = xs[0];
             for (int l = 1; l < 32; l++) { if (xs[l] < lo) lo = xs[l]; if (xs[l] > hi) hi = xs[l]; }
             if (lo > 0.0f) lo = 0.0f;          /* min term is subtracted, m>=0 */
@@ -432,6 +558,9 @@ static void quantize_q4_K(const float *src, uint8_t *dst, size_t nblk) {
             }
         }
     }
+}
+static void quantize_q4_K(const float *src, uint8_t *dst, size_t nblk) {
+    quantize_q4_K_core(src, dst, nblk, NULL);
 }
 
 /* ---- IQ2_XXS (sub-2-bit i-quant), ggml-compatible -----------------------
@@ -551,15 +680,15 @@ static void dequantize_iq2_xxs(const uint8_t *src, float *dst, size_t nblk) {
 }
 
 /* For an 8-element magnitude target `mag` (>=0) and trial scale `s`, pick the
- * grid point minimizing sum (mag[j] - s*grid[j])^2. Returns the grid index and
- * writes the squared error to *err. */
-static int iq2xxs_best_grid(const float *mag, float s, float *err) {
+ * grid point minimizing sum w[j]*(mag[j] - s*grid[j])^2. `w` may be NULL (all
+ * ones). Returns the grid index and writes the weighted squared error to *err. */
+static int iq2xxs_best_grid_w(const float *mag, const float *w, float s, float *err) {
     int best = 0; float best_e = 1e30f;
     for (int g = 0; g < 256; g++) {
         float e = 0.0f;
         for (int j = 0; j < 8; j++) {
             float d = mag[j] - s * (float)iq2xxs_grid_byte(g, j);
-            e += d * d;
+            e += (w ? w[j] : 1.0f) * d * d;
         }
         if (e < best_e) { best_e = e; best = g; }
     }
@@ -571,22 +700,27 @@ static int iq2xxs_best_grid(const float *mag, float s, float *err) {
  * parity-even 7-bit sign index, picks the nearest grid point at the group's
  * scale, and quantizes the per-group scale into the block f16 d + a 4-bit code.
  * Output is valid ggml; quality is below ggml's iterative neighbour search. */
-static void quantize_iq2_xxs(const float *src, uint8_t *dst, size_t nblk) {
+static void quantize_iq2_xxs_core(const float *src, uint8_t *dst, size_t nblk,
+                                  const float *imp) {
     for (size_t b = 0; b < nblk; b++) {
         const float *x = src + b * QK_K;
+        const float *xi = imp ? imp + b * QK_K : NULL;
         uint8_t *p = dst + b * 66;
         uint8_t *qs = p + 2;
         memset(p, 0, 66);
 
         float    mag[8][4][8];   /* abs magnitudes per group/sub-group        */
+        float    wgt[8][4][8];   /* importance weights per element            */
         uint8_t  sgn[8][4];      /* 7-bit parity-even sign index              */
         float    gscale[8];      /* continuous per-group scale                */
 
         for (int ib = 0; ib < 8; ib++) {
             const float *xb = x + ib * 32;
+            const float *wb = xi ? xi + ib * 32 : NULL;
             float gamax = 0.0f;
             for (int k = 0; k < 4; k++) {
                 const float *xk = xb + k * 8;
+                build_weights(wb ? wb + k * 8 : NULL, 8, wgt[ib][k]);
                 uint8_t s = 0; int nneg = 0;
                 for (int j = 0; j < 8; j++) {
                     float v = xk[j];
@@ -603,13 +737,16 @@ static void quantize_iq2_xxs(const float *src, uint8_t *dst, size_t nblk) {
                 sgn[ib][k] = s & 127;          /* bit7 is parity-implied */
             }
             /* Search the per-group scale (top grid magnitude is 43). Sweep a
-             * range around amax/43 and keep the scale with least total error. */
+             * range around amax/43 and keep the scale with least total
+             * (importance-weighted) error. */
             if (gamax < 1e-12f) { gscale[ib] = 0.0f; continue; }
             float base = gamax / 43.0f, best_s = base, best_e = 1e30f;
             for (int t = 4; t <= 64; t++) {
                 float s = base * 43.0f / (float)t; /* maps amax to magnitude t */
                 float tot = 0.0f, e;
-                for (int k = 0; k < 4; k++) { iq2xxs_best_grid(mag[ib][k], s, &e); tot += e; }
+                for (int k = 0; k < 4; k++) {
+                    iq2xxs_best_grid_w(mag[ib][k], wgt[ib][k], s, &e); tot += e;
+                }
                 if (tot < best_e) { best_e = tot; best_s = s; }
             }
             gscale[ib] = best_s;
@@ -637,7 +774,7 @@ static void quantize_iq2_xxs(const float *src, uint8_t *dst, size_t nblk) {
             float db = qd * (0.5f + (float)l);   /* effective group scale */
             uint32_t a0 = 0, a1 = 0;
             for (int k = 0; k < 4; k++) {
-                int g = (db > 0.0f) ? iq2xxs_best_grid(mag[ib][k], db, NULL) : 0;
+                int g = (db > 0.0f) ? iq2xxs_best_grid_w(mag[ib][k], wgt[ib][k], db, NULL) : 0;
                 a0 |= (uint32_t)(g & 0xff) << (8 * k);
                 a1 |= (uint32_t)(sgn[ib][k] & 127) << (7 * k);
             }
@@ -651,11 +788,17 @@ static void quantize_iq2_xxs(const float *src, uint8_t *dst, size_t nblk) {
     }
 }
 
+static void quantize_iq2_xxs(const float *src, uint8_t *dst, size_t nblk) {
+    quantize_iq2_xxs_core(src, dst, nblk, NULL);
+}
+
 /* Q2_K encode (RTN): 16 sub-blocks of 16 elems, each an affine (scale4, min4);
  * value = d*scale4*q - dmin*min4, q in [0,3]. Super d/dmin are f16. */
-static void quantize_q2_K(const float *src, uint8_t *dst, size_t nblk) {
+static void quantize_q2_K_core(const float *src, uint8_t *dst, size_t nblk,
+                               const float *imp) {
     for (size_t b = 0; b < nblk; b++) {
         const float *x = src + b * QK_K;
+        const float *xi = imp ? imp + b * QK_K : NULL;
         uint8_t *p = dst + b * 84;
         uint8_t *scales = p;          /* 16 */
         uint8_t *q = p + 16;          /* 64 */
@@ -664,6 +807,13 @@ static void quantize_q2_K(const float *src, uint8_t *dst, size_t nblk) {
         float subscale[16], submin[16];
         for (int is = 0; is < 16; is++) {
             const float *xs = x + is * 16;
+            if (xi) {
+                float w[16], tmin; uint8_t L[16], La[16];
+                build_weights(xi + is*16, 16, w);
+                subscale[is] = make_qkx2_w(16, 3, xs, w, L, La, &tmin);
+                submin[is]   = tmin;
+                continue;
+            }
             float lo = xs[0], hi = xs[0];
             for (int l = 1; l < 16; l++) { if (xs[l] < lo) lo = xs[l]; if (xs[l] > hi) hi = xs[l]; }
             if (lo > 0.0f) lo = 0.0f;          /* min term subtracted, >= 0 */
@@ -706,12 +856,17 @@ static void quantize_q2_K(const float *src, uint8_t *dst, size_t nblk) {
         }
     }
 }
+static void quantize_q2_K(const float *src, uint8_t *dst, size_t nblk) {
+    quantize_q2_K_core(src, dst, nblk, NULL);
+}
 
 /* Q5_K encode (RTN): 8 sub-blocks of 32, each an affine (scale, min);
  * value = d*scale*q - dmin*min, q in [0,31] (low nibble in ql, bit 5 in qh). */
-static void quantize_q5_K(const float *src, uint8_t *dst, size_t nblk) {
+static void quantize_q5_K_core(const float *src, uint8_t *dst, size_t nblk,
+                               const float *imp) {
     for (size_t b = 0; b < nblk; b++) {
         const float *x = src + b * QK_K;
+        const float *xi = imp ? imp + b * QK_K : NULL;
         uint8_t *p = dst + b * 176;
         uint8_t *qh = p + 16;         /* 32 */
         uint8_t *ql = p + 48;         /* 128 */
@@ -720,6 +875,13 @@ static void quantize_q5_K(const float *src, uint8_t *dst, size_t nblk) {
         float subscale[8], submin[8];
         for (int j = 0; j < 8; j++) {
             const float *xs = x + j * 32;
+            if (xi) {
+                float w[32], tmin; uint8_t L[32], La[32];
+                build_weights(xi + j*32, 32, w);
+                subscale[j] = make_qkx2_w(32, 31, xs, w, L, La, &tmin);
+                submin[j]   = tmin;
+                continue;
+            }
             float lo = xs[0], hi = xs[0];
             for (int l = 1; l < 32; l++) { if (xs[l] < lo) lo = xs[l]; if (xs[l] > hi) hi = xs[l]; }
             if (lo > 0.0f) lo = 0.0f;
@@ -761,6 +923,9 @@ static void quantize_q5_K(const float *src, uint8_t *dst, size_t nblk) {
             }
         }
     }
+}
+static void quantize_q5_K(const float *src, uint8_t *dst, size_t nblk) {
+    quantize_q5_K_core(src, dst, nblk, NULL);
 }
 
 ornith_status oq_quantize(uint32_t type, const float *src, void *dst,
@@ -820,6 +985,44 @@ ornith_status oq_quantize(uint32_t type, const float *src, void *dst,
         ornith_set_error("oq_quantize: type %s not implemented",
                          oggml_type_name(type));
         return ORNITH_ERR_UNSUPPORTED;
+    }
+}
+
+ornith_status oq_quantize_imatrix(uint32_t type, const float *src, void *dst,
+                                  size_t n_elems, const float *importance) {
+    /* No importance -> identical to the plain RTN path. The weighted path is
+     * only implemented for the k-/i-quants where it matters (sub-block scale
+     * selection); other types fall through to the unweighted encoder. */
+    if (!importance) return oq_quantize(type, src, dst, n_elems);
+    switch (type) {
+    case OGGML_Q2_K:
+        if (n_elems % QK_K) { ornith_set_error("Q2_K needs multiple of %d", QK_K);
+                              return ORNITH_ERR_FORMAT; }
+        quantize_q2_K_core(src, dst, n_elems / QK_K, importance);
+        return ORNITH_OK;
+    case OGGML_Q4_K:
+        if (n_elems % QK_K) { ornith_set_error("Q4_K needs multiple of %d", QK_K);
+                              return ORNITH_ERR_FORMAT; }
+        quantize_q4_K_core(src, dst, n_elems / QK_K, importance);
+        return ORNITH_OK;
+    case OGGML_Q5_K:
+        if (n_elems % QK_K) { ornith_set_error("Q5_K needs multiple of %d", QK_K);
+                              return ORNITH_ERR_FORMAT; }
+        quantize_q5_K_core(src, dst, n_elems / QK_K, importance);
+        return ORNITH_OK;
+    case OGGML_Q6_K:
+        if (n_elems % QK_K) { ornith_set_error("Q6_K needs multiple of %d", QK_K);
+                              return ORNITH_ERR_FORMAT; }
+        quantize_q6_K_core(src, dst, n_elems / QK_K, importance);
+        return ORNITH_OK;
+    case OGGML_IQ2_XXS:
+        if (n_elems % QK_K) { ornith_set_error("IQ2_XXS needs multiple of %d", QK_K);
+                              return ORNITH_ERR_FORMAT; }
+        quantize_iq2_xxs_core(src, dst, n_elems / QK_K, importance);
+        return ORNITH_OK;
+    default:
+        /* importance not used for this type */
+        return oq_quantize(type, src, dst, n_elems);
     }
 }
 

@@ -12,6 +12,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "ornith_gguf_write.h"
 #include "ornith_quant.h"
+#include "ornith_imatrix.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -492,6 +493,13 @@ void ogguf_loaded_free(ogguf_loaded *l) {
 
 ornith_status ornith_quantize_file(const char *in_path, const char *out_path,
                                    uint32_t base, FILE *log) {
+    return ornith_quantize_file_imatrix(in_path, out_path, base, NULL, log);
+}
+
+ornith_status ornith_quantize_file_imatrix(const char *in_path,
+                                           const char *out_path, uint32_t base,
+                                           const void *imatrix, FILE *log) {
+    const oimatrix *im = (const oimatrix *)imatrix;
     ogguf_loaded in;
     ornith_status s = ogguf_load(in_path, &in);
     if (s != ORNITH_OK) return s;
@@ -536,7 +544,24 @@ ornith_status ornith_quantize_file(const char *in_path, const char *out_path,
         uint8_t *odata = malloc(obytes ? obytes : 1);
         if (!odata) { free(f32); s = ORNITH_ERR_OOM; ornith_set_error("oom (odata)");
                       goto done; }
-        s = oq_quantize(tgt, f32, odata, t->n_elements);
+
+        /* Importance-weighted path: a recorded per-input-channel vector whose
+         * length matches the tensor's input width (dims[0]) is the SAME for
+         * every output row, so we quantize row by row, broadcasting it. */
+        const float *chan_imp = NULL; size_t cn = 0; uint64_t ccount = 0;
+        if (im) chan_imp = oimatrix_get(im, t->name, &cn, &ccount);
+        size_t in_w  = t->n_dims > 0 ? (size_t)t->dims[0] : t->n_elements;
+        size_t row_b = oq_row_bytes(tgt, in_w);
+        int    weighted = chan_imp && in_w && cn == in_w && row_b &&
+                          (t->n_elements % in_w) == 0;
+        if (weighted) {
+            size_t nrows = t->n_elements / in_w;
+            for (size_t r = 0; r < nrows && s == ORNITH_OK; r++)
+                s = oq_quantize_imatrix(tgt, f32 + r * in_w, odata + r * row_b,
+                                        in_w, chan_imp);
+        } else {
+            s = oq_quantize(tgt, f32, odata, t->n_elements);
+        }
         free(f32);
         if (s != ORNITH_OK) { free(odata); goto done; }
 
@@ -545,13 +570,14 @@ ornith_status ornith_quantize_file(const char *in_path, const char *out_path,
         if (s != ORNITH_OK) goto done;
 
         if (log) {
+            const char *imtag = weighted ? " [imatrix]" : "";
             if (why)
-                fprintf(log, "  %-40s %-8s -> %-6s (policy %s; fell back: %s)\n",
+                fprintf(log, "  %-40s %-8s -> %-6s (policy %s; fell back: %s)%s\n",
                         t->name, oggml_type_name(t->type), oggml_type_name(tgt),
-                        oggml_type_name(want), why);
+                        oggml_type_name(want), why, imtag);
             else
-                fprintf(log, "  %-40s %-8s -> %-6s\n", t->name,
-                        oggml_type_name(t->type), oggml_type_name(tgt));
+                fprintf(log, "  %-40s %-8s -> %-6s%s\n", t->name,
+                        oggml_type_name(t->type), oggml_type_name(tgt), imtag);
         }
     }
 

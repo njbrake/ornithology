@@ -103,4 +103,14 @@ void          ogguf_loaded_free(ogguf_loaded *l);
 ornith_status ornith_quantize_file(const char *in_path, const char *out_path,
                                    uint32_t base, FILE *log);
 
+/* Same as ornith_quantize_file, but if `imatrix` (an `oimatrix *`, passed as a
+ * void* to keep this header free of the imatrix include) is non-NULL, each
+ * tensor that has a recorded per-input-channel importance vector is quantized
+ * importance-weighted (oq_quantize_imatrix), row by row. Tensors with no
+ * imatrix entry, or whose recorded vector length does not match the tensor's
+ * input width, fall back to the unweighted encoder. */
+ornith_status ornith_quantize_file_imatrix(const char *in_path,
+                                           const char *out_path, uint32_t base,
+                                           const void *imatrix, FILE *log);
+
 #endif /* ORNITH_GGUF_WRITE_H */

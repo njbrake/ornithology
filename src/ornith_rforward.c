@@ -2,6 +2,7 @@
 #include "ornith_rforward.h"
 #include "ornith_gguf_write.h"
 #include "ornith_quant.h"
+#include "ornith_imatrix.h"
 #include "ornith_qdot.h"
 #include "ornith_tensor.h"
 #include "ornith_sample.h"
@@ -138,6 +139,12 @@ static void matmul_batch_q(const rmodel *m, const ogguf_ltensor *W,
                            const float *X, float *Y, int Tn) {
     int in  = (int)W->dims[0];
     int out = (int)W->dims[1];
+
+    /* imatrix collection hook: when a collector is active, accumulate the
+     * per-input-channel sum of squared activations for this weight. Cheap
+     * (one pointer compare when off) and single-threaded (runs before the
+     * worker threads spawn below). */
+    oimatrix_on_matmul(W->name, X, in, Tn);
 
     /* If we have an integer vec_dot for this weight type, quantize each of the
      * Tn activation columns to Q8_K ONCE and reuse it across all output rows
@@ -841,6 +848,18 @@ static void rprefill(rmodel *m, rstate *s, const int32_t *toks, int np,
                     argmax_f(logits, m->a.vocab_size),
                     logits[argmax_f(logits, m->a.vocab_size)]);
     }
+}
+
+/* Run prefill over `tokens` (nt of them) for side effects only (e.g. imatrix
+ * collection via the global hook); logits are discarded. Each call uses a fresh
+ * recurrent/KV state, so chunks are independent — fine for calibration. */
+ornith_status rmodel_prefill_only(rmodel *m, const int32_t *tokens, int nt) {
+    if (nt <= 0) { ornith_set_error("empty chunk"); return ORNITH_ERR_FORMAT; }
+    rstate *s = rstate_new(&m->a, nt + 4);
+    if (!s) { ornith_set_error("oom"); return ORNITH_ERR_OOM; }
+    rprefill(m, s, tokens, nt, NULL);
+    rstate_free(s);
+    return ORNITH_OK;
 }
 
 /* Pick the next token: greedy argmax when sp is NULL or greedy, else sample.

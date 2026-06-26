@@ -50,6 +50,17 @@ bool oq_can_decode(uint32_t type);
  * we don't encode, ORNITH_ERR_FORMAT if `n_elems` is not block-aligned. */
 ornith_status oq_quantize(uint32_t type, const float *src, void *dst,
                           size_t n_elems);
+
+/* Importance-weighted quantize: like oq_quantize, but `importance` (length
+ * n_elems, per-element; typically a per-input-channel value broadcast across a
+ * weight row) steers sub-block scale/min selection so high-importance channels
+ * keep lower reconstruction error. Implemented for the k-/i-quants
+ * (Q2_K/Q4_K/Q5_K/Q6_K/IQ2_XXS); other types ignore `importance`. Passing
+ * `importance == NULL` is exactly oq_quantize. This is basic importance
+ * weighting (weighted scale fit), not llama.cpp's full kmeans-neighbour search. */
+ornith_status oq_quantize_imatrix(uint32_t type, const float *src, void *dst,
+                                  size_t n_elems, const float *importance);
+
 /* Inverse of oq_quantize: decode `n_elems` of `type` from `src` to f32. */
 ornith_status oq_dequantize(uint32_t type, const void *src, float *dst,
                             size_t n_elems);

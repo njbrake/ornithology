@@ -40,6 +40,10 @@ ornith_status rmodel_generate_s(rmodel *m, const char *prompt, int n_predict,
 /* The model id: general.name from the GGUF if present, else NULL. */
 const char *rmodel_name(const rmodel *m);
 
+/* Prefill `tokens` (nt of them) for side effects only (imatrix collection via
+ * the global hook in ornith_imatrix.h); discards logits. */
+ornith_status rmodel_prefill_only(rmodel *m, const int32_t *tokens, int nt);
+
 /* Token-level, stop-aware greedy generation for the server. Prefills
  * `prompt_ids` (n_prompt of them), then greedily decodes up to `n_predict`
  * tokens. For each produced token it invokes `on_token(id, piece, ud)` where

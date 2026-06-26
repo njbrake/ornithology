@@ -23,6 +23,8 @@
 #include "ornith_quant.h"
 #include "ornith_forward.h"
 #include "ornith_rforward.h"
+#include "ornith_imatrix.h"
+#include "ornith_tokenizer.h"
 #include "ornith_server.h"
 #include "ornith_agent.h"
 #include <string.h>
@@ -97,10 +99,23 @@ static int parse_quant_type(const char *s, uint32_t *out) {
     return -1;
 }
 
-static int cmd_quantize(const char *in, const char *out, uint32_t base) {
+static int cmd_quantize(const char *in, const char *out, uint32_t base,
+                        const char *imatrix_path) {
     fprintf(stderr, "quantize: %s -> %s (policy: tools/quantize/POLICY.md)\n",
             in, out);
-    ornith_status s = ornith_quantize_file(in, out, base, stderr);
+    oimatrix *im = NULL;
+    if (imatrix_path) {
+        ornith_status ls = oimatrix_load(imatrix_path, &im);
+        if (ls != ORNITH_OK) {
+            fprintf(stderr, "quantize: imatrix %s: %s\n", ornith_strerror(ls),
+                    ornith_last_error());
+            return 1;
+        }
+        fprintf(stderr, "quantize: importance-weighting from %s (%zu tensors)\n",
+                imatrix_path, oimatrix_count(im));
+    }
+    ornith_status s = ornith_quantize_file_imatrix(in, out, base, im, stderr);
+    oimatrix_free(im);
     if (s != ORNITH_OK) {
         fprintf(stderr, "quantize: %s: %s\n", ornith_strerror(s),
                 ornith_last_error());
@@ -108,6 +123,102 @@ static int cmd_quantize(const char *in, const char *out, uint32_t base) {
     }
     fprintf(stderr, "quantize: wrote %s\n", out);
     fprintf(stderr, "verify with: ornith inspect --tensors %s\n", out);
+    return 0;
+}
+
+/* Read an entire text file into a malloc'd NUL-terminated buffer. */
+static char *read_text_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return NULL; }
+    rewind(f);
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[rd] = '\0';
+    return buf;
+}
+
+/* ornith imatrix <model.gguf> <corpus.txt> [-o out.dat] [--chunks N]
+ * Tokenize the corpus, run prefill in chunks with collection on, save the
+ * importance matrix. CHUNK is the per-prefill token window; --chunks caps how
+ * many chunks are processed (0 = all). */
+static int cmd_imatrix(const char *model, const char *corpus,
+                       const char *out_path, int max_chunks) {
+    enum { CHUNK = 256 };
+    rmodel *m = NULL;
+    ornith_status s = rmodel_load(model, &m);
+    if (s != ORNITH_OK) {
+        fprintf(stderr, "imatrix: load failed: %s\n", ornith_last_error());
+        return 1;
+    }
+    char *text = read_text_file(corpus);
+    if (!text) {
+        fprintf(stderr, "imatrix: cannot read corpus %s\n", corpus);
+        rmodel_free(m);
+        return 1;
+    }
+    int32_t *ids = NULL; int n = 0;
+    s = otok_encode(rmodel_tokenizer(m), text, &ids, &n);
+    free(text);
+    if (s != ORNITH_OK || n == 0) {
+        fprintf(stderr, "imatrix: tokenize failed or empty corpus\n");
+        free(ids); rmodel_free(m);
+        return 1;
+    }
+    fprintf(stderr, "imatrix: %d tokens, chunk=%d\n", n, CHUNK);
+
+    oimatrix *im = oimatrix_new();
+    if (!im) { fprintf(stderr, "imatrix: oom\n"); free(ids); rmodel_free(m); return 1; }
+
+    oimatrix_collect_begin(im);
+    int chunks = 0;
+    for (int off = 0; off < n; off += CHUNK) {
+        if (max_chunks > 0 && chunks >= max_chunks) break;
+        int len = n - off; if (len > CHUNK) len = CHUNK;
+        s = rmodel_prefill_only(m, ids + off, len);
+        if (s != ORNITH_OK) {
+            fprintf(stderr, "imatrix: prefill failed: %s\n", ornith_last_error());
+            break;
+        }
+        chunks++;
+        fprintf(stderr, "\rimatrix: chunk %d (%d/%d tokens)", chunks,
+                off + len, n);
+        fflush(stderr);
+    }
+    fprintf(stderr, "\n");
+    oimatrix_collect_end();
+
+    free(ids);
+    if (s != ORNITH_OK) { oimatrix_free(im); rmodel_free(m); return 1; }
+
+    /* report a few per-tensor stats */
+    size_t nt = oimatrix_count(im);
+    fprintf(stderr, "imatrix: collected %zu tensors over %d chunks\n", nt, chunks);
+    for (size_t i = 0; i < nt && i < 6; i++) {
+        const char *nm = oimatrix_name_at(im, i);
+        size_t vn = 0; uint64_t cnt = 0;
+        const float *v = oimatrix_get(im, nm, &vn, &cnt);
+        if (!v) continue;
+        float mn = v[0], mx = v[0]; double sum = 0;
+        for (size_t k = 0; k < vn; k++) { if (v[k] < mn) mn = v[k]; if (v[k] > mx) mx = v[k]; sum += v[k]; }
+        fprintf(stderr, "  %-36s n=%-6zu count=%-6llu min=%.3g mean=%.3g max=%.3g\n",
+                nm, vn, (unsigned long long)cnt, (double)mn,
+                vn ? sum / (double)vn : 0.0, (double)mx);
+    }
+
+    s = oimatrix_save(im, out_path);
+    oimatrix_free(im);
+    rmodel_free(m);
+    if (s != ORNITH_OK) {
+        fprintf(stderr, "imatrix: save %s: %s\n", out_path, ornith_last_error());
+        return 1;
+    }
+    fprintf(stderr, "imatrix: wrote %s\n", out_path);
+    fprintf(stderr, "quantize with: ornith quantize --imatrix %s <in> <out>\n", out_path);
     return 0;
 }
 
@@ -325,7 +436,9 @@ static void usage(const char *argv0) {
         "  %s arch [397b|35b]\n"
         "  %s config <config.json>\n"
         "  %s inspect [--tensors] <model.gguf>\n"
-        "  %s quantize [--base TYPE] <in.gguf> <out.gguf>\n"
+        "  %s quantize [--base TYPE] [--imatrix imatrix.dat] <in.gguf> <out.gguf>\n"
+        "  %s imatrix <model.gguf> <corpus.txt> [-o imatrix.dat] [--chunks N]\n"
+        "        collect an importance matrix over a calibration corpus\n"
         "  %s run [--prompt TEXT] [-n N] [--temp T] [--top-p P] [--top-k K]\n"
         "         [--min-p M] [--repeat-penalty R] [--seed S] [--kv-q8] <model.gguf>\n"
         "        with --prompt: real-weight generation (default N=32);\n"
@@ -342,7 +455,7 @@ static void usage(const char *argv0) {
         "quantize applies the asymmetric POLICY.md mapping; --base TYPE\n"
         "(f32|f16|bf16|q8_0|q4_0, default f16) covers tensors with no rule.\n",
         ORNITH_VERSION, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-        argv0, argv0);
+        argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -368,6 +481,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "quantize")) {
         uint32_t base = OGGML_F16;
         const char *paths[2] = { NULL, NULL };
+        const char *imatrix_path = NULL;
         int np = 0;
         for (int i = 2; i < argc; i++) {
             if (!strcmp(argv[i], "--base") && i + 1 < argc) {
@@ -376,12 +490,28 @@ int main(int argc, char **argv) {
                             argv[i]);
                     return 1;
                 }
+            } else if (!strcmp(argv[i], "--imatrix") && i + 1 < argc) {
+                imatrix_path = argv[++i];
             } else if (np < 2) {
                 paths[np++] = argv[i];
             }
         }
         if (np != 2) { usage(argv[0]); return 1; }
-        return cmd_quantize(paths[0], paths[1], base);
+        return cmd_quantize(paths[0], paths[1], base, imatrix_path);
+    }
+    if (!strcmp(cmd, "imatrix")) {
+        const char *model = NULL, *corpus = NULL, *out = "imatrix.dat";
+        int max_chunks = 0;
+        for (int i = 2; i < argc; i++) {
+            if ((!strcmp(argv[i], "-o") || !strcmp(argv[i], "--output"))
+                && i + 1 < argc) out = argv[++i];
+            else if (!strcmp(argv[i], "--chunks") && i + 1 < argc)
+                max_chunks = atoi(argv[++i]);
+            else if (!model) model = argv[i];
+            else if (!corpus) corpus = argv[i];
+        }
+        if (!model || !corpus) { usage(argv[0]); return 1; }
+        return cmd_imatrix(model, corpus, out, max_chunks);
     }
     if (!strcmp(cmd, "run")) {
         const char *path = NULL, *prompt = NULL;

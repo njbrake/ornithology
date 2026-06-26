@@ -36,6 +36,7 @@ CORE := \
   $(SRC_DIR)/ornith_gguf.c \
   $(SRC_DIR)/ornith_gguf_write.c \
   $(SRC_DIR)/ornith_quant.c \
+  $(SRC_DIR)/ornith_imatrix.c \
   $(SRC_DIR)/ornith_qdot.c \
   $(SRC_DIR)/ornith_model.c \
   $(SRC_DIR)/ornith_tensor.c \
@@ -102,8 +103,8 @@ cuda-spark: $(CORE_OBJ) $(CLI)
 # Test suite (CPU only). Each test file is its own binary; all must pass.
 # GOLDEN_TOP_TOKEN pins the tiny-model regression output (see test_forward.c).
 GOLDEN_TOP_TOKEN ?= 9
-TESTS := test_gguf test_quant test_qdot test_tensor test_attn test_moe \
-         test_forward test_tokenizer test_server test_sample test_agent
+TESTS := test_gguf test_quant test_imatrix test_qdot test_tensor test_attn \
+         test_moe test_forward test_tokenizer test_server test_sample test_agent
 
 test: $(CORE_OBJ)
 	@set -e; for t in $(TESTS); do \
