@@ -3,12 +3,13 @@
  * The on-disk block layouts here match ggml/llama.cpp byte-for-byte so the
  * GGUFs we emit are interoperable with the wider ecosystem. We implement the
  * conversions ornithology's own quantizer (ROADMAP M1) needs end to end —
- * F32, F16, BF16, Q8_0 and Q4_0 — and expose a policy lookup that encodes the
- * tensor-name -> quant-type table from tools/quantize/POLICY.md.
+ * F32, F16, BF16, Q8_0, Q4_0, the k-quants Q2_K/Q4_K/Q5_K/Q6_K and the sub-2-bit
+ * i-quant IQ2_XXS — and expose a policy lookup that encodes the tensor-name ->
+ * quant-type table from tools/quantize/POLICY.md.
  *
- * Types we do NOT yet encode (the k-/i-quants: Q2_K, Q5_K, Q6_K, IQ2_XXS,
- * IQ3_S, ...) are reported as unimplemented so the quantizer can fall back to
- * F16 and log it honestly rather than emit a corrupt block.
+ * Types we do NOT yet encode (e.g. IQ3_S, IQ2_S) are reported as unimplemented
+ * so the quantizer can fall back to F16 and log it honestly rather than emit a
+ * corrupt block.
  */
 #ifndef ORNITH_QUANT_H
 #define ORNITH_QUANT_H
@@ -38,8 +39,8 @@ size_t oq_row_bytes(uint32_t type, size_t n_elems);
  * fallback). */
 bool oq_is_implemented(uint32_t type);
 
-/* True if oq_dequantize can DECODE `type` — a superset of oq_is_implemented
- * that also includes read-only paths (Q2_K, Q5_K) needed to load real GGUFs. */
+/* True if oq_dequantize can DECODE `type` — a superset of oq_is_implemented for
+ * any future decode-only paths needed to load real GGUFs. */
 bool oq_can_decode(uint32_t type);
 
 /* ---- codecs ------------------------------------------------------------ */
