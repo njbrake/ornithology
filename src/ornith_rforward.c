@@ -5,6 +5,7 @@
 #include "ornith_qdot.h"
 #include "ornith_tensor.h"
 #include "ornith_attn.h"
+#include "ornith_moe.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -301,6 +302,87 @@ static void ffn_dense(const rmodel *m, int L, const float *x, float *x_acc) {
     free(xn); free(g); free(u); free(o);
 }
 
+/* One expert's 2D weight as a stack tensor view into a 3D expert stack.
+ * The stack is [.., out, in] with `in` (dims[0]) contiguous; expert e begins at
+ * e * out rows of oq_row_bytes(type, in) bytes. */
+static ogguf_ltensor expert_view(const ogguf_ltensor *W, int e, int in, int out) {
+    ogguf_ltensor v = *W;
+    v.n_dims = 2; v.dims[0] = (uint64_t)in; v.dims[1] = (uint64_t)out;
+    size_t rb = oq_row_bytes(W->type, (size_t)in);
+    v.data = (uint8_t *)W->data + (size_t)e * (size_t)out * rb;
+    return v;
+}
+
+/* MoE SwiGLU FFN: router top-k over routed experts + always-on shared expert.
+ * Mirrors the tested ornith_moe logic (router -> top-k softmax -> per-expert
+ * SwiGLU -> weighted sum -> shared expert) but on real quantized weights via the
+ * quant-aware matvec. Expert tensors are 3D [hidden, inter, n_expert] (gate/up)
+ * and [inter, hidden, n_expert] (down); sliced per expert with expert_view. */
+static void ffn_moe(const rmodel *m, int L, const float *x, float *x_acc) {
+    const ornith_arch *a = &m->a;
+    int H = a->hidden_size, I = a->moe_inter_size;
+    int ne = a->n_routed_experts, K = a->experts_per_tok;
+    float *xn = malloc((size_t)H*sizeof(float));
+    ot_rmsnorm(x, f32(Tb(m, L, "post_attention_norm.weight")), xn, H, a->rms_norm_eps);
+
+    const ogguf_ltensor *router = Tb(m, L, "ffn_gate_inp.weight");  /* [H, ne] */
+    float *logits = malloc((size_t)ne*sizeof(float));
+    matvec_q(m, router, xn, logits);
+    int *idx = malloc((size_t)K*sizeof(int));
+    float *w = malloc((size_t)K*sizeof(float));
+    ornith_moe_route(logits, ne, K, idx, w);
+
+    const ogguf_ltensor *ge = Tb(m, L, "ffn_gate_exps.weight");
+    const ogguf_ltensor *ue = Tb(m, L, "ffn_up_exps.weight");
+    const ogguf_ltensor *de = Tb(m, L, "ffn_down_exps.weight");
+    float *g = malloc((size_t)I*sizeof(float));
+    float *u = malloc((size_t)I*sizeof(float));
+    float *o = malloc((size_t)H*sizeof(float));
+    float *acc = calloc((size_t)H, sizeof(float));
+    for (int s = 0; s < K; s++) {
+        int e = idx[s];
+        ogguf_ltensor gv = expert_view(ge, e, H, I);
+        ogguf_ltensor uv = expert_view(ue, e, H, I);
+        ogguf_ltensor dv = expert_view(de, e, I, H);
+        matvec_q(m, &gv, xn, g);
+        matvec_q(m, &uv, xn, u);
+        for (int i = 0; i < I; i++) g[i] = ot_silu1(g[i]) * u[i];
+        matvec_q(m, &dv, g, o);
+        ot_addscaled_(acc, o, w[s], H);
+    }
+
+    /* always-on shared expert (+ optional sigmoid gate ffn_gate_inp_shexp) */
+    const ogguf_ltensor *sgate_w = Tb(m, L, "ffn_gate_shexp.weight");
+    if (sgate_w) {
+        int sI = a->shared_inter_size;
+        float *sg = malloc((size_t)sI*sizeof(float));
+        float *su = malloc((size_t)sI*sizeof(float));
+        float *so = malloc((size_t)H*sizeof(float));
+        matvec_q(m, sgate_w, xn, sg);
+        matvec_q(m, Tb(m, L, "ffn_up_shexp.weight"), xn, su);
+        for (int i = 0; i < sI; i++) sg[i] = ot_silu1(sg[i]) * su[i];
+        matvec_q(m, Tb(m, L, "ffn_down_shexp.weight"), sg, so);
+        const ogguf_ltensor *sgi = Tb(m, L, "ffn_gate_inp_shexp.weight"); /* [H]->1 */
+        if (sgi) {
+            ogguf_ltensor gv = *sgi; gv.n_dims = 2; gv.dims[0] = (uint64_t)H; gv.dims[1] = 1;
+            float gl = 0.0f; matvec_q(m, &gv, xn, &gl);
+            float gs = ot_sigmoid(gl);
+            for (int i = 0; i < H; i++) so[i] *= gs;
+        }
+        ot_add_(acc, so, H);
+        free(sg); free(su); free(so);
+    }
+
+    ot_add_(x_acc, acc, H);
+    free(xn); free(logits); free(idx); free(w); free(g); free(u); free(o); free(acc);
+}
+
+/* FFN dispatch: MoE when the model has routed experts, else dense. */
+static void ffn_layer(const rmodel *m, int L, const float *x, float *x_acc) {
+    if (m->a.n_routed_experts > 0) ffn_moe(m, L, x, x_acc);
+    else                           ffn_dense(m, L, x, x_acc);
+}
+
 static void full_attn(const rmodel *m, rstate *s, int L,
                       const float *xn, float *x_acc) {
     const ornith_arch *a = &m->a;
@@ -548,7 +630,10 @@ static void rforward_prefill(rmodel *m, rstate *s, const int32_t *tokens,
             full_attn_prefill(m, s, L, XN, nt, base, X);
         else
             linear_attn_prefill(m, s, L, XN, nt, chunk, X);
-        ffn_dense_prefill(m, L, X, nt, X);
+        if (a->n_routed_experts > 0)            /* MoE routes per token */
+            for (int t = 0; t < nt; t++) ffn_moe(m, L, X + (size_t)t*H, X + (size_t)t*H);
+        else
+            ffn_dense_prefill(m, L, X, nt, X);
     }
     s->pos = base + nt;
 
@@ -576,7 +661,7 @@ static void rforward_token(rmodel *m, rstate *s, int32_t token, float *logits) {
         ot_rmsnorm(x, f32(Tb(m, L, "attn_norm.weight")), xn, H, a->rms_norm_eps);
         if (ornith_layer_is_full_attn(a, L)) full_attn(m, s, L, xn, x);
         else                                 linear_attn(m, s, L, xn, x);
-        ffn_dense(m, L, x, x);
+        ffn_layer(m, L, x, x);
     }
     s->pos++;
 
@@ -606,28 +691,84 @@ ornith_status rmodel_load(const char *path, rmodel **out) {
 
     ornith_arch *a = &m->a;
     memset(a, 0, sizeof(*a));
-    snprintf(a->model_type, sizeof(a->model_type), "qwen35");
-    a->hidden_size  = (int)kv_u32(&m->l, "qwen35.embedding_length", 4096);
-    a->num_layers   = (int)kv_u32(&m->l, "qwen35.block_count", 32);
-    a->num_attn_heads = (int)kv_u32(&m->l, "qwen35.attention.head_count", 16);
-    a->num_kv_heads = (int)kv_u32(&m->l, "qwen35.attention.head_count_kv", 4);
-    a->head_dim     = (int)kv_u32(&m->l, "qwen35.attention.key_length", 256);
-    a->rope_dim     = (int)kv_u32(&m->l, "qwen35.rope.dimension_count", 64);
-    a->rope_theta   = kv_f32(&m->l, "qwen35.rope.freq_base", 1e7f);
-    a->rms_norm_eps = kv_f32(&m->l, "qwen35.attention.layer_norm_rms_epsilon", 1e-6f);
-    a->full_attn_interval = (int)kv_u32(&m->l, "qwen35.full_attention_interval", 4);
-    a->attn_output_gate = true;
-    a->lin_key_heads   = (int)kv_u32(&m->l, "qwen35.ssm.group_count", 16);
-    a->lin_value_heads = (int)kv_u32(&m->l, "qwen35.ssm.time_step_rank", 32);
-    a->lin_key_head_dim   = (int)kv_u32(&m->l, "qwen35.ssm.state_size", 128);
-    a->lin_value_head_dim = a->lin_key_head_dim;
-    a->lin_conv_kernel = (int)kv_u32(&m->l, "qwen35.ssm.conv_kernel", 4);
-    a->shared_inter_size = (int)kv_u32(&m->l, "qwen35.feed_forward_length", 12288);
-    a->n_routed_experts = 0;
-    a->experts_per_tok = 0;
-    /* vocab from token_embd dims[1] */
+
+    /* Metadata key prefix follows general.architecture: "qwen35" (dense 9B) or
+     * "qwen35moe" (MoE 35B/397B). Structural dims are DERIVED FROM TENSOR SHAPES
+     * (robust against metadata-key drift between the dense and MoE archs);
+     * scalars (rope/eps) come from metadata under the detected prefix. */
+    char *archs = kv_str(&m->l, "general.architecture");
+    snprintf(a->model_type, sizeof(a->model_type), "%s", archs ? archs : "qwen35");
+    char pfx[64]; snprintf(pfx, sizeof(pfx), "%s", archs ? archs : "qwen35");
+    free(archs);
+    char kb[160];
+    #define MK(suffix) (snprintf(kb, sizeof(kb), "%s.%s", pfx, suffix), kb)
+
     const ogguf_ltensor *te = T(m, "token_embd.weight");
-    a->vocab_size = te ? (int)te->dims[1] : 248320;
+    a->hidden_size = te ? (int)te->dims[0] : (int)kv_u32(&m->l, MK("embedding_length"), 4096);
+    a->vocab_size  = te ? (int)te->dims[1] : 248320;
+
+    /* layer count: highest blk.N with an attn_norm */
+    { char nm[64]; int n = 0;
+      for (;;) { snprintf(nm, sizeof(nm), "blk.%d.attn_norm.weight", n); if (!T(m, nm)) break; n++; }
+      a->num_layers = n ? n : (int)kv_u32(&m->l, MK("block_count"), 32); }
+
+    /* full-attention interval: first layer carrying attn_q (pattern i%I==I-1) */
+    { char nm[64]; int ff = -1;
+      for (int i = 0; i < a->num_layers; i++) {
+          snprintf(nm, sizeof(nm), "blk.%d.attn_q.weight", i);
+          if (T(m, nm)) { ff = i; break; }
+      }
+      a->full_attn_interval = ff >= 0 ? ff + 1
+                                      : (int)kv_u32(&m->l, MK("full_attention_interval"), 4); }
+
+    a->rope_theta   = kv_f32(&m->l, MK("rope.freq_base"), 1e7f);
+    a->rms_norm_eps = kv_f32(&m->l, MK("attention.layer_norm_rms_epsilon"), 1e-6f);
+    a->rope_dim     = (int)kv_u32(&m->l, MK("rope.dimension_count"), 64);
+    a->attn_output_gate = true;
+
+    /* full-attention head geometry from the first full layer (attn_q packs
+     * [query|gate] when attn_output_gate, so q_out = 2*nh*hd). */
+    { int ff = a->full_attn_interval - 1;
+      const ogguf_ltensor *aqn = Tb(m, ff, "attn_q_norm.weight");
+      const ogguf_ltensor *aq  = Tb(m, ff, "attn_q.weight");
+      const ogguf_ltensor *ak  = Tb(m, ff, "attn_k.weight");
+      a->head_dim = aqn ? (int)aqn->dims[0] : 256;
+      int q_out = aq ? (int)aq->dims[1] : a->head_dim * 16;
+      a->num_attn_heads = (q_out / (a->attn_output_gate ? 2 : 1)) / a->head_dim;
+      a->num_kv_heads = ak ? (int)ak->dims[1] / a->head_dim : 4; }
+
+    /* linear (SSM) geometry from the first linear layer */
+    { int l0 = 0;
+      while (l0 < a->num_layers && ornith_layer_is_full_attn(a, l0)) l0++;
+      const ogguf_ltensor *ssa = Tb(m, l0, "ssm_a");
+      const ogguf_ltensor *ssn = Tb(m, l0, "ssm_norm.weight");
+      const ogguf_ltensor *qkv = Tb(m, l0, "attn_qkv.weight");
+      const ogguf_ltensor *cv  = Tb(m, l0, "ssm_conv1d.weight");
+      a->lin_value_heads = ssa ? (int)ssa->dims[0] : 32;
+      a->lin_value_head_dim = ssn ? (int)ssn->dims[0] : 128;
+      a->lin_key_head_dim   = a->lin_value_head_dim;
+      a->lin_conv_kernel = cv ? (int)cv->dims[0] : 4;
+      int Cc = qkv ? (int)qkv->dims[1] : 8192;
+      int vd = a->lin_value_heads * a->lin_value_head_dim;
+      int qd = (Cc - vd) / 2;
+      a->lin_key_heads = a->lin_key_head_dim ? qd / a->lin_key_head_dim : 16; }
+
+    /* MoE vs dense: presence of routed-expert tensors. */
+    const ogguf_ltensor *ge0 = Tb(m, 0, "ffn_gate_exps.weight");
+    if (ge0) {
+        a->n_routed_experts = (int)ge0->dims[2];   /* [hidden, inter, n_expert] */
+        a->moe_inter_size   = (int)ge0->dims[1];
+        a->experts_per_tok  = (int)kv_u32(&m->l, MK("expert_used_count"), 8);
+        const ogguf_ltensor *sh = Tb(m, 0, "ffn_gate_shexp.weight");
+        a->shared_inter_size = sh ? (int)sh->dims[1] : 0;
+    } else {
+        a->n_routed_experts = 0;
+        a->experts_per_tok  = 0;
+        const ogguf_ltensor *fg = Tb(m, 0, "ffn_gate.weight");
+        a->shared_inter_size = fg ? (int)fg->dims[1]
+                                  : (int)kv_u32(&m->l, MK("feed_forward_length"), 12288);
+    }
+    #undef MK
 
     st = otok_load_from_gguf(&m->l, &m->tok);
     if (st != ORNITH_OK) { ogguf_loaded_free(&m->l); free(m); return st; }
