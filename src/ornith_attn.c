@@ -144,6 +144,18 @@ void ornith_delta_step(ornith_delta_state *s, const float *q, const float *k,
  *
  * S_in projections (S_in k_i, S_in q_i) are computed against the *incoming*
  * state for the whole chunk before S is mutated, so chunks compose exactly.
+ *
+ * NUMERICAL STABILITY: the within-chunk decay ratios p_i/p_j (j<=i) are NOT
+ * formed by dividing the two cumulative products p_i and p_j. With real-model
+ * decays (alpha can be well below 1) p_i underflows to 0 within a chunk of a
+ * few dozen steps, and p_i/p_j would become 0/0 = NaN. Instead each ratio
+ * p_i/p_j = prod_{l=j+1}^{i} alpha_l is accumulated directly as a bounded
+ * sub-product (always in (0,1], underflow at worst yields a harmless 0). The
+ * standalone p_i (decay of the *incoming* state into position i) is still
+ * accumulated cumulatively; underflowing it to 0 is correct — the carried
+ * state has simply decayed away — and never produces a NaN. This is exactly
+ * the form a chunked GPU kernel must use (decay computed per-block, not via a
+ * global cumulative product), so it doubles as the Metal kernel reference.
  */
 static void delta_chunk(ornith_delta_state *s, const float *Q, const float *K,
                         const float *V, const float *alpha, const float *beta,
@@ -178,15 +190,18 @@ static void delta_chunk(ornith_delta_state *s, const float *Q, const float *K,
         }
     }
 
-    /* solve (I+M)U = T by forward substitution (row i depends on rows j<i) */
+    /* solve (I+M)U = T by forward substitution (row i depends on rows j<i).
+     * ratio = p_i/p_j is accumulated downward as prod_{l=j+1}^{i} alpha_l. */
     for (int i = 0; i < C; i++) {
         float bi = beta[i], pi = p[i];
         float *ui = U + (size_t)i * dv;
         const float *vi = V + (size_t)i * dv;
         for (int r = 0; r < dv; r++)
             ui[r] = bi * vi[r] - bi * pi * Sk[(size_t)i*dv + r];   /* t_i */
-        for (int j = 0; j < i; j++) {
-            float Mij = bi * (pi / p[j]) * kk[(size_t)i*C + j];
+        float ratio = 1.0f;                       /* ratio = p_i/p_j */
+        for (int j = i - 1; j >= 0; j--) {
+            ratio *= alpha[j + 1];                /* prod_{l=j+1}^{i} alpha_l */
+            float Mij = bi * ratio * kk[(size_t)i*C + j];
             if (Mij != 0.0f) {
                 const float *uj = U + (size_t)j * dv;
                 for (int r = 0; r < dv; r++) ui[r] -= Mij * uj[r];
@@ -199,18 +214,28 @@ static void delta_chunk(ornith_delta_state *s, const float *Q, const float *K,
         float pi = p[i];
         float *oi = O + (size_t)i * dv;
         for (int r = 0; r < dv; r++) oi[r] = pi * Sq[(size_t)i*dv + r];
-        for (int j = 0; j <= i; j++) {
-            float w = (pi / p[j]) * kq[(size_t)i*C + j];
+        /* j == i term (ratio == 1) */
+        {
+            float w = kq[(size_t)i*C + i];
+            const float *ui = U + (size_t)i * dv;
+            for (int r = 0; r < dv; r++) oi[r] += w * ui[r];
+        }
+        float ratio = 1.0f;                       /* ratio = p_i/p_j */
+        for (int j = i - 1; j >= 0; j--) {
+            ratio *= alpha[j + 1];
+            float w = ratio * kq[(size_t)i*C + j];
             const float *uj = U + (size_t)j * dv;
             for (int r = 0; r < dv; r++) oi[r] += w * uj[r];
         }
     }
 
-    /* state update: S_out = p_{C-1} S_in + sum_j (p_{C-1}/p_j) u_j k_j^T */
+    /* state update: S_out = p_{C-1} S_in + sum_j (p_{C-1}/p_j) u_j k_j^T.
+     * ratio = p_{C-1}/p_j accumulated downward as prod_{l=j+1}^{C-1} alpha_l. */
     float pC = p[C-1];
     for (int i = 0; i < dk * dv; i++) S[i] *= pC;
-    for (int j = 0; j < C; j++) {
-        float wj = pC / p[j];
+    float ratio = 1.0f;
+    for (int j = C - 1; j >= 0; j--) {
+        float wj = ratio;                         /* p_{C-1}/p_j */
         const float *uj = U + (size_t)j * dv;
         const float *kj = K + (size_t)j * dk;
         for (int r = 0; r < dv; r++) {
@@ -219,6 +244,7 @@ static void delta_chunk(ornith_delta_state *s, const float *Q, const float *K,
             float *Sr = S + (size_t)r * dk;
             for (int c = 0; c < dk; c++) Sr[c] += ur * kj[c];
         }
+        ratio *= alpha[j];                        /* next: p_{C-1}/p_{j-1} */
     }
 
     free(p); free(Sk); free(Sq); free(U); free(kk); free(kq);
