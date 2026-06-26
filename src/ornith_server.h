@@ -155,4 +155,12 @@ char *srv_build_anthropic_response_tools(const char *id, const char *model,
                                          const char *text, const srv_toolcalls *calls,
                                          int prompt_tok, int compl_tok);
 
+/* Responses-protocol tool-call builder. Emits output:[{type:"function_call",
+ * name, arguments:"<json string>", call_id, id, status:"completed"}, ...] with
+ * top-level status "completed". Each call must already carry an `id` (used as
+ * call_id). Returns a malloc'd string. */
+char *srv_build_responses_response_tools(const char *id, const char *model,
+                                         const srv_toolcalls *calls,
+                                         int prompt_tok, int compl_tok);
+
 #endif /* ORNITH_SERVER_H */

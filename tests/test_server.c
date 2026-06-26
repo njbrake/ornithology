@@ -335,6 +335,73 @@ static void test_tool_call_output(void) {
     srv_toolcalls_free(&c3);
 }
 
+static void test_responses_tools(void) {
+    printf("== responses tools (parse + emit) ==\n");
+    /* Responses function tools are flat: {type:"function", name, description,
+     * parameters}. tool_choice {type:"function", name} -> NAMED. The input array
+     * carries a prior function_call (assistant) + function_call_output (result)
+     * that must fold back into the rendered prompt. */
+    ojson *r = parse(
+        "{\"max_output_tokens\":32,"
+        "\"tool_choice\":{\"type\":\"function\",\"name\":\"get_weather\"},"
+        "\"tools\":[{\"type\":\"function\",\"name\":\"get_weather\","
+        "\"description\":\"Get the weather for a city\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}}],"
+        "\"input\":[{\"role\":\"user\",\"content\":\"weather in Paris?\"},"
+        "{\"type\":\"function_call\",\"name\":\"get_weather\","
+        "\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\",\"call_id\":\"call_1\"},"
+        "{\"type\":\"function_call_output\",\"call_id\":\"call_1\","
+        "\"output\":\"18C and sunny\"}]}");
+    chat_msgs m; gen_opts o = {0};
+    const char *err = srv_parse_responses(r, &m, &o);
+    CHECK(err == NULL, "parse ok");
+    CHECK(o.tools.len == 1 && strcmp(o.tools.v[0].name, "get_weather") == 0,
+          "responses function tool name (flat form)");
+    CHECK(o.tools.len == 1 && o.tools.v[0].description
+          && strcmp(o.tools.v[0].description, "Get the weather for a city") == 0,
+          "responses tool description");
+    CHECK(o.tools.len == 1 && o.tools.v[0].parameters
+          && has(o.tools.v[0].parameters, "\"city\""), "responses tool parameters captured");
+    CHECK(o.tool_choice == TOOL_CHOICE_NAMED, "responses tool_choice named");
+    CHECK(o.tool_choice_name && strcmp(o.tool_choice_name, "get_weather") == 0,
+          "responses named tool is 'get_weather'");
+    /* history: user + assistant(function_call) + tool(function_call_output) */
+    CHECK(m.len == 3, "user + function_call + function_call_output -> 3 messages");
+    CHECK(m.len == 3 && strcmp(m.v[1].role, "assistant") == 0
+          && has(m.v[1].content, "<tool_call>")
+          && has(m.v[1].content, "\"city\":\"Paris\""),
+          "function_call -> assistant <tool_call> block");
+    CHECK(m.len == 3 && strcmp(m.v[2].role, "tool") == 0
+          && strcmp(m.v[2].content, "18C and sunny") == 0,
+          "function_call_output -> tool role message");
+    char *prompt = srv_render_chatml_tools(&m, &o.tools, o.tool_choice, o.tool_choice_name);
+    CHECK(has(prompt, "<tools>") && has(prompt, "get_weather"), "tools rendered into prompt");
+    CHECK(has(prompt, "<|im_start|>tool\n18C and sunny<|im_end|>"), "tool result in ChatML prompt");
+    free(prompt);
+    chat_msgs_free(&m); gen_opts_free(&o); ojson_free(r);
+
+    /* emit: a model <tool_call> output -> Responses function_call output item. */
+    const char *out =
+        "<tool_call>\n{\"name\": \"get_weather\", "
+        "\"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
+    srv_toolcalls calls;
+    int n = srv_parse_tool_calls_from_text(out, &calls);
+    CHECK(n == 1, "one tool call parsed from text");
+    free(calls.v[0].id); calls.v[0].id = strdup("call_xyz");
+    char *resp = srv_build_responses_response_tools("resp-9", "ornith", &calls, 6, 5);
+    CHECK(has(resp, "\"object\":\"response\"") && has(resp, "\"status\":\"completed\""),
+          "responses object/status completed");
+    CHECK(has(resp, "\"type\":\"function_call\""), "responses function_call output item");
+    CHECK(has(resp, "\"name\":\"get_weather\""), "responses function_call name");
+    CHECK(has(resp, "\"call_id\":\"call_xyz\""), "responses function_call call_id");
+    CHECK(has(resp, "\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\""),
+          "responses arguments is an escaped JSON string");
+    CHECK(has(resp, "\"input_tokens\":6") && has(resp, "\"output_tokens\":5"),
+          "responses usage");
+    free(resp);
+    srv_toolcalls_free(&calls);
+}
+
 int main(void) {
     test_escape();
     test_render();
@@ -345,6 +412,7 @@ int main(void) {
     test_parse_tools();
     test_tool_result_roundtrip();
     test_tool_call_output();
+    test_responses_tools();
     printf("\n%s (%d failure%s)\n",
            failures ? "SERVER TESTS FAILED" : "ALL SERVER TESTS PASSED",
            failures, failures == 1 ? "" : "s");

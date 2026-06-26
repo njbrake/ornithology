@@ -340,7 +340,9 @@ static void parse_tools_anthropic(const ojson *arr, srv_tools *out) {
     }
 }
 
-/* OpenAI tool_choice: "auto"|"none"|"required" or {type:"function",function:{name}}. */
+/* OpenAI tool_choice: "auto"|"none"|"required" or {type:"function",function:{name}}.
+ * Also accepts the Responses flat form {type:"function",name:..} (name directly
+ * on the object rather than nested under "function"). */
 static void parse_tool_choice_openai(const ojson *root, gen_opts *o) {
     const ojson *tc = ojson_get(root, "tool_choice");
     if (!tc) return;
@@ -351,6 +353,7 @@ static void parse_tool_choice_openai(const ojson *root, gen_opts *o) {
     } else if (tc->type == OJSON_OBJECT) {
         const ojson *fn = ojson_get(tc, "function");
         const char *nm = fn ? ojson_get_str(fn, "name", NULL) : NULL;
+        if (!nm) nm = ojson_get_str(tc, "name", NULL);
         if (nm) { o->tool_choice = TOOL_CHOICE_NAMED;
                   free(o->tool_choice_name); o->tool_choice_name = strdup(nm); }
     }
@@ -518,6 +521,11 @@ const char *srv_parse_responses(const ojson *root, chat_msgs *out, gen_opts *o) 
     if (o->max_tokens <= 0) o->max_tokens = 256;
     o->stream = ojson_get_bool(root, "stream", false);
     srv_parse_sampling(root, o);
+    /* Responses function tools: [{type:"function", name, description, parameters}].
+     * parse_tools_openai tolerates this flat form (it falls back to the item
+     * itself when there is no nested "function" object). */
+    parse_tools_openai(ojson_get(root, "tools"), &o->tools);
+    parse_tool_choice_openai(root, o);
     const char *instr = ojson_get_str(root, "instructions", NULL);
     if (instr) chat_msgs_add(out, "system", instr);
     const ojson *input = ojson_get(root, "input");
@@ -525,12 +533,38 @@ const char *srv_parse_responses(const ojson *root, chat_msgs *out, gen_opts *o) 
     if (input->type == OJSON_STRING) {
         chat_msgs_add(out, "user", input->str ? input->str : "");
     } else if (input->type == OJSON_ARRAY) {
-        /* array of items; each may be a content block or a {role,content} msg */
+        /* array of items; each may be a content block, a {role,content} msg, a
+         * prior function_call (assistant tool call) or a function_call_output
+         * (tool result) — the latter two are folded back into the history. */
         for (size_t i = 0; i < input->count; i++) {
             const ojson *it = input->items[i];
             if (!it) continue;
             if (it->type == OJSON_STRING) { chat_msgs_add(out, "user", it->str); continue; }
             if (it->type != OJSON_OBJECT) continue;
+            const char *type = ojson_get_str(it, "type", NULL);
+            if (type && !strcmp(type, "function_call")) {
+                /* a prior assistant tool call -> <tool_call> block in history */
+                const char *nm = ojson_get_str(it, "name", NULL);
+                const ojson *args = ojson_get(it, "arguments");
+                char *as = NULL;
+                if (args && args->type == OJSON_STRING) as = strdup(args->str ? args->str : "{}");
+                else if (args) { sbuf ab; sbuf_init(&ab); ojson_stringify(&ab, args); as = ab.data; }
+                sbuf cb; sbuf_init(&cb);
+                append_tool_call_block(&cb, nm, as);
+                chat_msgs_add(out, "assistant", cb.data);
+                sbuf_free(&cb); free(as);
+                continue;
+            }
+            if (type && !strcmp(type, "function_call_output")) {
+                /* the tool result for a prior call -> a `tool` role message */
+                const ojson *outp = ojson_get(it, "output");
+                char *t = (outp && outp->type == OJSON_STRING)
+                            ? strdup(outp->str ? outp->str : "")
+                            : collapse_content(outp);
+                chat_msgs_add(out, "tool", t);
+                free(t);
+                continue;
+            }
             const ojson *c = ojson_get(it, "content");
             const char *role = ojson_get_str(it, "role", "user");
             if (c) { char *t = collapse_content(c); chat_msgs_add(out, role, t); free(t); }
@@ -717,6 +751,31 @@ char *srv_build_anthropic_response_tools(const char *id, const char *model,
     sbuf_puts(&b, "],\"stop_reason\":\"tool_use\",\"stop_sequence\":null,");
     sbuf_printf(&b, "\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d}}",
                 prompt_tok, compl_tok);
+    return b.data;
+}
+
+char *srv_build_responses_response_tools(const char *id, const char *model,
+                                         const srv_toolcalls *calls,
+                                         int prompt_tok, int compl_tok) {
+    sbuf b; sbuf_init(&b);
+    sbuf_puts(&b, "{\"id\":"); sbuf_jstr(&b, id);
+    sbuf_puts(&b, ",\"object\":\"response\",\"status\":\"completed\",\"model\":");
+    sbuf_jstr(&b, model);
+    sbuf_puts(&b, ",\"output\":[");
+    for (int i = 0; i < calls->len; i++) {
+        if (i) sbuf_puts(&b, ",");
+        const char *cid = calls->v[i].id ? calls->v[i].id : "";
+        sbuf_puts(&b, "{\"type\":\"function_call\",\"id\":"); sbuf_jstr(&b, cid);
+        sbuf_puts(&b, ",\"call_id\":"); sbuf_jstr(&b, cid);
+        sbuf_puts(&b, ",\"name\":"); sbuf_jstr(&b, calls->v[i].name ? calls->v[i].name : "");
+        /* Responses carries function arguments as a JSON *string* (like Chat) */
+        sbuf_puts(&b, ",\"arguments\":");
+        sbuf_jstr(&b, calls->v[i].arguments ? calls->v[i].arguments : "{}");
+        sbuf_puts(&b, ",\"status\":\"completed\"}");
+    }
+    sbuf_puts(&b, "]");
+    sbuf_printf(&b, ",\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d,"
+                "\"total_tokens\":%d}}", prompt_tok, compl_tok, prompt_tok + compl_tok);
     return b.data;
 }
 
@@ -1050,8 +1109,7 @@ static void run_request(int fd, api_style api, const ojson *root) {
     srv_toolcalls calls;
     int ncalls = srv_parse_tool_calls_from_text(text.data, &calls);
     bool emit_tools = ncalls > 0 && opt.tools.len > 0 &&
-                      opt.tool_choice != TOOL_CHOICE_NONE &&
-                      (api == API_CHAT || api == API_ANTHROPIC);
+                      opt.tool_choice != TOOL_CHOICE_NONE;
     if (emit_tools) {
         for (int i = 0; i < calls.len; i++) {
             char tid[80];
@@ -1061,6 +1119,9 @@ static void run_request(int fd, api_style api, const ojson *root) {
         if (api == API_CHAT) {
             body = srv_build_chat_response_tools(id, g_model_id, created, NULL,
                                                  &calls, n_prompt, count);
+        } else if (api == API_RESPONSES) {
+            body = srv_build_responses_response_tools(id, g_model_id,
+                                                      &calls, n_prompt, count);
         } else {
             char *clean = strip_tool_calls(text.data);
             body = srv_build_anthropic_response_tools(id, g_model_id, clean,
@@ -1082,6 +1143,101 @@ static void run_request(int fd, api_style api, const ojson *root) {
 }
 
 /* ---- simple GET handlers ----------------------------------------------- */
+
+/* A tiny self-contained chat page (no external deps / CDN). It POSTs to this
+ * same server's /v1/chat/completions using the page's own origin and renders the
+ * assistant reply, making `ornith serve` browsable. Embedded as a C string. */
+static const char ORNITH_INDEX_HTML[] =
+"<!doctype html>\n"
+"<html lang=\"en\">\n"
+"<head>\n"
+"<meta charset=\"utf-8\">\n"
+"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+"<title>Ornithology chat</title>\n"
+"<style>\n"
+"  :root { color-scheme: light dark; }\n"
+"  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 0 auto;\n"
+"         padding: 1rem; line-height: 1.4; }\n"
+"  h1 { font-size: 1.2rem; }\n"
+"  #log { border: 1px solid #8888; border-radius: 8px; padding: .75rem;\n"
+"         min-height: 240px; margin-bottom: .75rem; white-space: pre-wrap; }\n"
+"  .msg { margin: .4rem 0; }\n"
+"  .role { font-weight: 600; }\n"
+"  .user .role { color: #2563eb; }\n"
+"  .assistant .role { color: #16a34a; }\n"
+"  .err { color: #dc2626; }\n"
+"  #row { display: flex; gap: .5rem; }\n"
+"  #q { flex: 1; font: inherit; padding: .5rem; border-radius: 6px;\n"
+"       border: 1px solid #8888; resize: vertical; }\n"
+"  button { font: inherit; padding: .5rem 1rem; border-radius: 6px;\n"
+"           border: 1px solid #8888; cursor: pointer; }\n"
+"  button[disabled] { opacity: .5; cursor: default; }\n"
+"</style>\n"
+"</head>\n"
+"<body>\n"
+"<h1>Ornithology chat</h1>\n"
+"<div id=\"log\"></div>\n"
+"<div id=\"row\">\n"
+"  <textarea id=\"q\" rows=\"2\" placeholder=\"Ask something...\"></textarea>\n"
+"  <button id=\"send\">Send</button>\n"
+"</div>\n"
+"<script>\n"
+"  const log = document.getElementById('log');\n"
+"  const q = document.getElementById('q');\n"
+"  const send = document.getElementById('send');\n"
+"  const history = [];\n"
+"  function add(role, text) {\n"
+"    const d = document.createElement('div');\n"
+"    d.className = 'msg ' + role;\n"
+"    const r = document.createElement('span');\n"
+"    r.className = 'role'; r.textContent = role + ': ';\n"
+"    d.appendChild(r);\n"
+"    d.appendChild(document.createTextNode(text));\n"
+"    log.appendChild(d); log.scrollTop = log.scrollHeight;\n"
+"    return d;\n"
+"  }\n"
+"  async function ask() {\n"
+"    const text = q.value.trim();\n"
+"    if (!text) return;\n"
+"    q.value = ''; send.disabled = true;\n"
+"    add('user', text);\n"
+"    history.push({ role: 'user', content: text });\n"
+"    const pending = add('assistant', '...');\n"
+"    try {\n"
+"      const res = await fetch('/v1/chat/completions', {\n"
+"        method: 'POST',\n"
+"        headers: { 'Content-Type': 'application/json' },\n"
+"        body: JSON.stringify({ model: 'ornith', messages: history,\n"
+"                               stream: false })\n"
+"      });\n"
+"      const data = await res.json();\n"
+"      if (!res.ok) throw new Error((data.error && data.error.message) || res.status);\n"
+"      const msg = data.choices && data.choices[0] && data.choices[0].message;\n"
+"      let reply = (msg && msg.content) || '';\n"
+"      if (!reply && msg && msg.tool_calls) reply = '[tool_calls] ' +\n"
+"        JSON.stringify(msg.tool_calls);\n"
+"      pending.lastChild.textContent = reply || '(empty)';\n"
+"      if (reply) history.push({ role: 'assistant', content: reply });\n"
+"    } catch (e) {\n"
+"      pending.classList.add('err');\n"
+"      pending.lastChild.textContent = 'error: ' + e.message;\n"
+"    } finally {\n"
+"      send.disabled = false; q.focus();\n"
+"    }\n"
+"  }\n"
+"  send.addEventListener('click', ask);\n"
+"  q.addEventListener('keydown', e => {\n"
+"    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); }\n"
+"  });\n"
+"  q.focus();\n"
+"</script>\n"
+"</body>\n"
+"</html>\n";
+
+static void handle_index(int fd) {
+    send_response(fd, 200, "OK", "text/html; charset=utf-8",
+                  ORNITH_INDEX_HTML, sizeof(ORNITH_INDEX_HTML) - 1);
+}
 
 static void handle_health(int fd) { send_json(fd, 200, "OK", "{\"status\":\"ok\"}"); }
 static void handle_models(int fd) {
@@ -1139,6 +1295,8 @@ static void handle_connection(int fd) {
     sscanf(req.data, "%15s %1023s", method, path);
     int is_get = strcmp(method, "GET") == 0, is_post = strcmp(method, "POST") == 0;
 
+    if (is_get && (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0))
+                                                   { handle_index(fd);  sbuf_free(&req); return; }
     if (is_get && strcmp(path, "/health") == 0)    { handle_health(fd); sbuf_free(&req); return; }
     if (is_get && strcmp(path, "/v1/models") == 0) { handle_models(fd); sbuf_free(&req); return; }
 
