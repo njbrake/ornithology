@@ -24,6 +24,7 @@
 #include "ornith_forward.h"
 #include "ornith_rforward.h"
 #include "ornith_server.h"
+#include "ornith_agent.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -332,10 +333,16 @@ static void usage(const char *argv0) {
         "        without --prompt: inspect + dequant check + synthetic self-test\n"
         "  %s serve [--host H] [--port P] <model.gguf>\n"
         "        OpenAI/Anthropic-compatible HTTP server (default 127.0.0.1:8080)\n"
+        "  %s repl [--temp T ...] <model.gguf>\n"
+        "        interactive multi-turn chat REPL (/reset, /exit)\n"
+        "  %s agent [--yolo] [--max-iters N] --task \"...\" <model.gguf>\n"
+        "        coding-agent loop (read_file/write_file/list_dir/run_command);\n"
+        "        write_file/run_command confirm via y/N unless --yolo\n"
         "\n"
         "quantize applies the asymmetric POLICY.md mapping; --base TYPE\n"
         "(f32|f16|bf16|q8_0|q4_0, default f16) covers tensors with no rule.\n",
-        ORNITH_VERSION, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+        ORNITH_VERSION, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
+        argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -407,6 +414,12 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(cmd, "serve")) {
         return ornith_server_main(argc - 2, argv + 2);
+    }
+    if (!strcmp(cmd, "repl") || !strcmp(cmd, "chat")) {
+        return ornith_repl_main(argc - 2, argv + 2);
+    }
+    if (!strcmp(cmd, "agent")) {
+        return ornith_agent_main(argc - 2, argv + 2);
     }
 
     usage(argv[0]);
