@@ -47,7 +47,9 @@ CORE := \
   $(SRC_DIR)/ornith_rforward.c \
   $(SRC_DIR)/ornith_forward.c \
   $(SRC_DIR)/ornith_server.c \
-  $(SRC_DIR)/ornith_agent.c
+  $(SRC_DIR)/ornith_agent.c \
+  $(SRC_DIR)/ornith_bench.c \
+  $(SRC_DIR)/ornith_eval.c
 
 CLI  := $(SRC_DIR)/ornith.c
 
@@ -105,7 +107,7 @@ cuda-spark: $(CORE_OBJ) $(CLI)
 GOLDEN_TOP_TOKEN ?= 9
 TESTS := test_gguf test_quant test_imatrix test_qdot test_tensor test_attn \
          test_moe test_forward test_tokenizer test_server test_sample test_agent \
-         test_session
+         test_session test_eval
 
 test: $(CORE_OBJ)
 	@set -e; for t in $(TESTS); do \
