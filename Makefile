@@ -1,0 +1,77 @@
+# ornithology — build system.
+#
+# Mirrors ds4's hardware-target layout. The default build is the portable
+# CPU/CLI path (no GPU, no GGML) so `inspect`/`config`/`arch` and the tests
+# work everywhere. GPU backends are opt-in targets.
+#
+#   make            # native CPU build -> ./ornith (+ tools)
+#   make metal      # macOS Metal backend (primary inference target)
+#   make cuda       # generic Linux CUDA
+#   make cuda-spark # CUDA tuned for DGX Spark / GB10
+#   make test       # build and run the test suite
+#   make clean
+
+CC      ?= cc
+CSTD    ?= -std=c11
+CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter $(CSTD)
+LDFLAGS ?=
+LIBS    ?= -lm
+
+SRC_DIR := src
+BUILD   := build
+
+# Core, backend-agnostic sources (compile everywhere).
+CORE := \
+  $(SRC_DIR)/ornith_util.c \
+  $(SRC_DIR)/ornith_json.c \
+  $(SRC_DIR)/ornith_config.c \
+  $(SRC_DIR)/ornith_gguf.c \
+  $(SRC_DIR)/ornith_model.c
+
+CLI  := $(SRC_DIR)/ornith.c
+
+CORE_OBJ := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(CORE))
+
+.PHONY: all metal cuda cuda-spark cpu test clean
+
+all: ornith
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+$(BUILD)/%.o: $(SRC_DIR)/%.c | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
+
+# Default CPU/CLI binary. The CPU backend is reference/diagnostics only.
+ornith: $(CORE_OBJ) $(CLI)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -DORNITH_BACKEND_CPU $(CORE_OBJ) $(CLI) \
+	  $(LDFLAGS) $(LIBS) -o $@
+
+cpu: ornith
+
+# macOS Metal — primary inference backend (compiles only on macOS).
+metal: $(CORE_OBJ) $(CLI)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -DORNITH_BACKEND_METAL \
+	  -x objective-c $(SRC_DIR)/ornith_metal.m \
+	  $(CORE_OBJ) $(CLI) $(LDFLAGS) \
+	  -framework Metal -framework Foundation -framework Accelerate \
+	  $(LIBS) -o ornith
+
+# Generic Linux CUDA.
+cuda: $(CORE_OBJ) $(CLI)
+	nvcc -O2 -I$(SRC_DIR) -DORNITH_BACKEND_CUDA \
+	  $(SRC_DIR)/ornith_cuda.cu $(CORE_OBJ) $(CLI) -lm -o ornith
+
+# DGX Spark / GB10 (sm_121a). Same sources, tuned arch flags.
+cuda-spark: $(CORE_OBJ) $(CLI)
+	nvcc -O2 -arch=sm_121a -I$(SRC_DIR) -DORNITH_BACKEND_CUDA \
+	  $(SRC_DIR)/ornith_cuda.cu $(CORE_OBJ) $(CLI) -lm -o ornith
+
+# Test suite (CPU only).
+test: $(CORE_OBJ)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_gguf.c $(CORE_OBJ) \
+	  $(LIBS) -o $(BUILD)/test_gguf
+	./$(BUILD)/test_gguf
+
+clean:
+	rm -rf $(BUILD) ornith

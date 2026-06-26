@@ -1,0 +1,19 @@
+# build artifacts
+/build/
+/ornith
+*.o
+*.obj
+
+# models / weights (never commit these)
+/gguf/
+/models/
+*.gguf
+*.safetensors
+*.dat
+imatrix*
+
+# editor / OS
+.DS_Store
+*.swp
+compile_commands.json
+.cache/
