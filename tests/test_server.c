@@ -5,6 +5,7 @@
  * history + max_tokens + stream, the three non-streaming response builders, and
  * rigorous JSON string escaping (quotes, backslashes, newlines, control chars).
  */
+#define _POSIX_C_SOURCE 200809L   /* strdup under -std=c11 */
 #include "ornith_server.h"
 #include "ornith_json.h"
 #include <stdio.h>
@@ -182,6 +183,158 @@ static void test_builders(void) {
     free(antL);
 }
 
+static void test_parse_tools(void) {
+    printf("== parse tools (both protocols) ==\n");
+    /* OpenAI chat: tools[].function{name,description,parameters} + tool_choice */
+    ojson *r = parse(
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"weather in Paris?\"}],"
+        "\"tool_choice\":\"required\","
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+        "\"description\":\"Get the weather for a city\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},"
+        "\"required\":[\"city\"]}}}]}");
+    chat_msgs m; gen_opts o = {0};
+    const char *err = srv_parse_openai_chat(r, &m, &o);
+    CHECK(err == NULL, "openai parse ok");
+    CHECK(o.tools.len == 1, "one tool parsed");
+    CHECK(o.tools.len == 1 && strcmp(o.tools.v[0].name, "get_weather") == 0, "tool name");
+    CHECK(o.tools.len == 1 && o.tools.v[0].description
+          && strcmp(o.tools.v[0].description, "Get the weather for a city") == 0, "tool description");
+    CHECK(o.tools.len == 1 && o.tools.v[0].parameters
+          && has(o.tools.v[0].parameters, "\"city\""), "tool parameters schema captured");
+    CHECK(o.tool_choice == TOOL_CHOICE_REQUIRED, "tool_choice required");
+
+    /* render tools into the prompt: name/desc/usage instructions must appear */
+    char *prompt = srv_render_chatml_tools(&m, &o.tools, o.tool_choice, o.tool_choice_name);
+    CHECK(has(prompt, "get_weather"), "prompt lists tool name");
+    CHECK(has(prompt, "Get the weather for a city"), "prompt lists tool description");
+    CHECK(has(prompt, "<tools>") && has(prompt, "</tools>"), "prompt has <tools> section");
+    CHECK(has(prompt, "<tool_call>"), "prompt instructs <tool_call> format");
+    CHECK(has(prompt, "must call at least one"), "required directive present");
+    CHECK(has(prompt, "<|im_start|>system\n"), "tools fold into a system block");
+    free(prompt);
+    chat_msgs_free(&m); gen_opts_free(&o); ojson_free(r);
+
+    /* Anthropic: tools[].input_schema + tool_choice{type:"tool",name} */
+    ojson *r2 = parse(
+        "{\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"tool_choice\":{\"type\":\"tool\",\"name\":\"lookup\"},"
+        "\"tools\":[{\"name\":\"lookup\",\"description\":\"Look something up\","
+        "\"input_schema\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}}]}");
+    chat_msgs m2; gen_opts o2 = {0};
+    const char *err2 = srv_parse_anthropic(r2, &m2, &o2);
+    CHECK(err2 == NULL, "anthropic parse ok");
+    CHECK(o2.tools.len == 1 && strcmp(o2.tools.v[0].name, "lookup") == 0, "anthropic tool name");
+    CHECK(o2.tools.len == 1 && o2.tools.v[0].parameters
+          && has(o2.tools.v[0].parameters, "\"q\""), "anthropic input_schema captured");
+    CHECK(o2.tool_choice == TOOL_CHOICE_NAMED, "anthropic tool_choice named");
+    CHECK(o2.tool_choice_name && strcmp(o2.tool_choice_name, "lookup") == 0, "named tool is 'lookup'");
+    char *p2 = srv_render_chatml_tools(&m2, &o2.tools, o2.tool_choice, o2.tool_choice_name);
+    CHECK(has(p2, "lookup") && has(p2, "must call the function named"), "anthropic prompt + named directive");
+    free(p2);
+    chat_msgs_free(&m2); gen_opts_free(&o2); ojson_free(r2);
+}
+
+static void test_tool_result_roundtrip(void) {
+    printf("== tool result round-trip into prompt ==\n");
+    /* OpenAI: assistant tool_call turn + a role:"tool" result must render back */
+    ojson *r = parse(
+        "{\"messages\":["
+        "{\"role\":\"user\",\"content\":\"weather in Paris?\"},"
+        "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\","
+        "\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+        "\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"18C and sunny\"}]}");
+    chat_msgs m; gen_opts o = {0};
+    const char *err = srv_parse_openai_chat(r, &m, &o);
+    CHECK(err == NULL, "openai history parse ok");
+    CHECK(m.len == 3, "user + assistant + tool -> 3 messages");
+    CHECK(m.len == 3 && strcmp(m.v[1].role, "assistant") == 0
+          && has(m.v[1].content, "<tool_call>")
+          && has(m.v[1].content, "get_weather")
+          && has(m.v[1].content, "\"city\":\"Paris\""), "assistant tool_call rendered to <tool_call>");
+    CHECK(m.len == 3 && strcmp(m.v[2].role, "tool") == 0
+          && strcmp(m.v[2].content, "18C and sunny") == 0, "tool result -> tool role message");
+    char *prompt = srv_render_chatml(&m);
+    CHECK(has(prompt, "<|im_start|>tool\n18C and sunny<|im_end|>"), "tool result in ChatML prompt");
+    CHECK(has(prompt, "<tool_call>"), "assistant tool_call in ChatML prompt");
+    free(prompt);
+    chat_msgs_free(&m); gen_opts_free(&o); ojson_free(r);
+
+    /* Anthropic: assistant tool_use block + user tool_result block */
+    ojson *r2 = parse(
+        "{\"max_tokens\":32,\"messages\":["
+        "{\"role\":\"user\",\"content\":\"weather?\"},"
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\","
+        "\"name\":\"get_weather\",\"input\":{\"city\":\"Paris\"}}]},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\","
+        "\"content\":\"18C and sunny\"}]}]}");
+    chat_msgs m2; gen_opts o2 = {0};
+    const char *err2 = srv_parse_anthropic(r2, &m2, &o2);
+    CHECK(err2 == NULL, "anthropic history parse ok");
+    CHECK(m2.len == 3, "user + assistant(tool_use) + tool_result -> 3 messages");
+    CHECK(m2.len == 3 && has(m2.v[1].content, "<tool_call>")
+          && has(m2.v[1].content, "get_weather")
+          && has(m2.v[1].content, "\"city\":\"Paris\""), "anthropic tool_use -> <tool_call>");
+    CHECK(m2.len == 3 && strcmp(m2.v[2].role, "tool") == 0
+          && strcmp(m2.v[2].content, "18C and sunny") == 0, "anthropic tool_result -> tool role");
+    chat_msgs_free(&m2); gen_opts_free(&o2); ojson_free(r2);
+}
+
+static void test_tool_call_output(void) {
+    printf("== parse model <tool_call> output ==\n");
+    const char *out =
+        "Let me check.\n<tool_call>\n{\"name\": \"get_weather\", "
+        "\"arguments\": {\"city\": \"Paris\", \"unit\": \"c\"}}\n</tool_call>";
+    srv_toolcalls calls;
+    int n = srv_parse_tool_calls_from_text(out, &calls);
+    CHECK(n == 1, "one tool call parsed from text");
+    CHECK(n == 1 && strcmp(calls.v[0].name, "get_weather") == 0, "parsed name");
+    CHECK(n == 1 && has(calls.v[0].arguments, "\"city\":\"Paris\"")
+          && has(calls.v[0].arguments, "\"unit\":\"c\""), "parsed arguments object");
+
+    /* OpenAI emission: content null, finish_reason tool_calls, arguments as a
+     * JSON *string* (so the inner quotes are escaped). */
+    free(calls.v[0].id); calls.v[0].id = strdup("call_abc");
+    char *chat = srv_build_chat_response_tools("chatcmpl-9", "ornith", 1, NULL, &calls, 5, 4);
+    CHECK(has(chat, "\"content\":null"), "openai content null with tool call");
+    CHECK(has(chat, "\"finish_reason\":\"tool_calls\""), "openai finish_reason tool_calls");
+    CHECK(has(chat, "\"id\":\"call_abc\""), "openai tool call id");
+    CHECK(has(chat, "\"name\":\"get_weather\""), "openai tool name");
+    CHECK(has(chat, "\"arguments\":\"{\\\"city\\\":\\\"Paris\\\""),
+          "openai arguments is an escaped JSON string");
+    free(chat);
+
+    /* Anthropic emission: tool_use block, input is the JSON object inline. */
+    char *ant = srv_build_anthropic_response_tools("msg-9", "ornith", NULL, &calls, 5, 4);
+    CHECK(has(ant, "\"type\":\"tool_use\""), "anthropic tool_use block");
+    CHECK(has(ant, "\"stop_reason\":\"tool_use\""), "anthropic stop_reason tool_use");
+    CHECK(has(ant, "\"input\":{\"city\":\"Paris\""), "anthropic input is inline object (not a string)");
+    CHECK(has(ant, "\"id\":\"call_abc\""), "anthropic tool_use id");
+    free(ant);
+    srv_toolcalls_free(&calls);
+
+    /* two calls in one output; argument escaping survives quotes/braces */
+    const char *out2 =
+        "<tool_call>{\"name\":\"a\",\"arguments\":{\"x\":\"q\\\"q\"}}</tool_call>"
+        "<tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>";
+    srv_toolcalls c2;
+    int n2 = srv_parse_tool_calls_from_text(out2, &c2);
+    CHECK(n2 == 2, "two tool calls parsed");
+    CHECK(n2 == 2 && strcmp(c2.v[0].name, "a") == 0 && strcmp(c2.v[1].name, "b") == 0, "names a,b");
+    CHECK(n2 == 2 && has(c2.v[0].arguments, "q\\\"q"), "embedded quote preserved in arguments");
+    char *chat2 = srv_build_chat_response_tools("id", "m", 1, NULL, &c2, 1, 1);
+    CHECK(has(chat2, "\"name\":\"a\"") && has(chat2, "\"name\":\"b\""), "both calls emitted");
+    free(chat2);
+    srv_toolcalls_free(&c2);
+
+    /* no tool call -> zero, plain completion path unaffected */
+    srv_toolcalls c3;
+    int n3 = srv_parse_tool_calls_from_text("just a normal answer", &c3);
+    CHECK(n3 == 0, "plain text -> no tool calls");
+    srv_toolcalls_free(&c3);
+}
+
 int main(void) {
     test_escape();
     test_render();
@@ -189,6 +342,9 @@ int main(void) {
     test_parse_responses();
     test_parse_anthropic();
     test_builders();
+    test_parse_tools();
+    test_tool_result_roundtrip();
+    test_tool_call_output();
     printf("\n%s (%d failure%s)\n",
            failures ? "SERVER TESTS FAILED" : "ALL SERVER TESTS PASSED",
            failures, failures == 1 ? "" : "s");
