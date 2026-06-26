@@ -154,9 +154,9 @@ int main(void) {
         }
         CHECK(q4_maxerr <= amax / 8.0 + 1e-3, "Q4_0 error within one step");
 
-        CHECK(oq_quantize(OGGML_IQ2_XXS, src, q8, 64) == ORNITH_ERR_UNSUPPORTED,
+        CHECK(oq_quantize(OGGML_IQ3_S, src, q8, 64) == ORNITH_ERR_UNSUPPORTED,
               "unimplemented type reported");
-        CHECK(!oq_is_implemented(OGGML_IQ2_XXS), "IQ2_XXS not implemented");
+        CHECK(!oq_is_implemented(OGGML_IQ3_S), "IQ3_S not implemented");
         CHECK(oq_is_implemented(OGGML_Q8_0), "Q8_0 implemented");
 
         /* k-quants: block geometry must match ggml exactly */
@@ -169,7 +169,15 @@ int main(void) {
         CHECK(oq_is_implemented(OGGML_Q6_K), "Q6_K encode implemented");
         CHECK(oq_can_decode(OGGML_Q2_K), "Q2_K decodable");
         CHECK(oq_can_decode(OGGML_Q5_K), "Q5_K decodable");
-        CHECK(!oq_is_implemented(OGGML_Q2_K), "Q2_K not yet encodable");
+        CHECK(oq_is_implemented(OGGML_Q2_K), "Q2_K now encodable");
+        CHECK(oq_is_implemented(OGGML_Q5_K), "Q5_K now encodable");
+
+        /* IQ2_XXS block geometry must match ggml exactly */
+        CHECK(oq_block_bytes(OGGML_IQ2_XXS) == 66, "IQ2_XXS block = 66 bytes");
+        CHECK(oq_block_elems(OGGML_IQ2_XXS) == 256, "IQ2_XXS block = 256 elems");
+        CHECK(oq_row_bytes(OGGML_IQ2_XXS, 512) == 132, "IQ2_XXS row bytes");
+        CHECK(oq_is_implemented(OGGML_IQ2_XXS), "IQ2_XXS encode implemented");
+        CHECK(oq_can_decode(OGGML_IQ2_XXS), "IQ2_XXS decodable");
 
         /* Q4_K / Q6_K round-trip over a 256-element super-block. Weight-like
          * data (roughly symmetric around 0). Error bounded by the quant step. */
@@ -197,6 +205,54 @@ int main(void) {
             if (e > q4k_maxerr) q4k_maxerr = e;
         }
         CHECK(q4k_maxerr < kamax / 8.0, "Q4_K round-trip error within a 4-bit step");
+
+        /* Q5_K round-trip: finer than Q4_K. */
+        CHECK(oq_quantize(OGGML_Q5_K, ksrc, kbuf, 256) == ORNITH_OK, "Q5_K quantize");
+        CHECK(oq_dequantize(OGGML_Q5_K, kbuf, kdeq, 256) == ORNITH_OK, "Q5_K dequant");
+        double q5k_maxerr = 0.0;
+        for (int i = 0; i < 256; i++) {
+            double e = fabs((double)kdeq[i] - ksrc[i]);
+            if (e > q5k_maxerr) q5k_maxerr = e;
+        }
+        CHECK(q5k_maxerr < kamax / 16.0, "Q5_K round-trip error within a 5-bit step");
+
+        /* Q2_K round-trip: coarse (2-bit + per-16 affine). Bound loosely. */
+        CHECK(oq_quantize(OGGML_Q2_K, ksrc, kbuf, 256) == ORNITH_OK, "Q2_K quantize");
+        CHECK(oq_dequantize(OGGML_Q2_K, kbuf, kdeq, 256) == ORNITH_OK, "Q2_K dequant");
+        double q2k_maxerr = 0.0, q2k_sse = 0.0, ksse = 0.0;
+        for (int i = 0; i < 256; i++) {
+            double e = fabs((double)kdeq[i] - ksrc[i]);
+            if (e > q2k_maxerr) q2k_maxerr = e;
+            q2k_sse += e * e; ksse += (double)ksrc[i] * ksrc[i];
+        }
+        CHECK(isfinite(q2k_maxerr) && q2k_maxerr < kamax / 2.0,
+              "Q2_K round-trip error bounded");
+        CHECK(q2k_sse < 0.15 * ksse, "Q2_K captures most signal energy");
+
+        /* IQ2_XXS round-trip: sub-2-bit, loose tolerance; just much better than
+         * dropping the tensor (relative SSE well under 1) and finite. */
+        uint8_t iqbuf[66];
+        float iqdeq[256];
+        CHECK(oq_quantize(OGGML_IQ2_XXS, ksrc, iqbuf, 256) == ORNITH_OK,
+              "IQ2_XXS quantize");
+        CHECK(oq_dequantize(OGGML_IQ2_XXS, iqbuf, iqdeq, 256) == ORNITH_OK,
+              "IQ2_XXS dequant");
+        double iq_sse = 0.0; int iq_finite = 1;
+        for (int i = 0; i < 256; i++) {
+            if (!isfinite(iqdeq[i])) iq_finite = 0;
+            double e = (double)iqdeq[i] - ksrc[i];
+            iq_sse += e * e;
+        }
+        CHECK(iq_finite, "IQ2_XXS output all finite");
+        CHECK(iq_sse < 0.5 * ksse, "IQ2_XXS much better than zeroing the tensor");
+
+        /* IQ2_XXS preserves sign of large-magnitude weights (it is a signed
+         * codebook). Check the few biggest entries keep their sign. */
+        int sign_ok = 1;
+        for (int i = 0; i < 256; i++)
+            if (fabsf(ksrc[i]) > 0.5f * kamax &&
+                (ksrc[i] > 0) != (iqdeq[i] >= 0)) sign_ok = 0;
+        CHECK(sign_ok, "IQ2_XXS keeps sign of large weights");
     }
 
     printf("== policy ==\n");
@@ -275,10 +331,11 @@ int main(void) {
         t = find_tensor(&g, "blk.0.ffn_gate_inp.weight");
         CHECK(t && t->type == OGGML_F16, "router kept F16");
         t = find_tensor(&g, "blk.0.ffn_gate_exps.weight");
-        CHECK(t && t->type == OGGML_F16,
-              "IQ2_XXS policy falls back to F16 honestly");
+        CHECK(t && t->type == OGGML_IQ2_XXS,
+              "IQ2_XXS policy now encodes (256 elems, block-aligned)");
         t = find_tensor(&g, "token_embd.weight");
-        CHECK(t && t->type == OGGML_F16, "Q5_K policy falls back to F16");
+        CHECK(t && t->type == OGGML_F16,
+              "Q5_K policy falls back to F16 (128 elems not 256-aligned)");
         ogguf_close(&g);
 
         /* and the F16-fallback data is still numerically sane */
