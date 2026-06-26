@@ -54,13 +54,7 @@ int main(void) {
 
     /* byte-level decode of an arbitrary id sequence (single chars). */
     {
-        int32_t ids[3]; int n = 0;
-        for (int i = 0; i < n_tokens; i++) {
-            if (!strcmp(t.tokens[i], "c")) ids[n++] = i;
-            if (!strcmp(t.tokens[i], "a")) ids[n++] = i;
-            if (!strcmp(t.tokens[i], "t")) ids[n++] = i;
-        }
-        /* reorder to spell "cat" */
+        /* find the single-char token ids that spell "cat" */
         int ic=-1,ia=-1,it=-1;
         for (int i = 0; i < n_tokens; i++) {
             if(!strcmp(t.tokens[i],"c"))ic=i;
