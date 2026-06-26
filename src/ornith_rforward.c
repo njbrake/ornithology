@@ -9,6 +9,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 
 static int32_t argmax_f(const float *v, int n) {
     int best = 0;
@@ -203,6 +204,41 @@ static float decay_alpha(float a_in, float a_coef, float dt_bias) {
     return expf(a_coef * ot_softplus(a_in + dt_bias));
 }
 
+/* Default chunk size for the linear-attention chunked parallel-scan prefill.
+ * Modest so intra-chunk buffers stay small (the Metal kernel mirrors this). */
+#define RFWD_PREFILL_CHUNK 32
+
+/* Gated delta-net output post-processing for ONE token, shared by the step
+ * (decode) path and the chunked (prefill) path so the tail math can never
+ * drift between them:
+ *   1) scale the raw per-head delta output by 1/sqrt(dk) (NOT a no-op: the
+ *      gated RMSNorm's eps regularizes small heads, so absolute scale matters,
+ *      matching llama.cpp ggml_gated_delta_net);
+ *   2) per-head RMSNorm with ssm_norm;
+ *   3) multiply by SiLU(attn_gate(xn));
+ *   4) out-projection (ssm_out), accumulated into x_acc.
+ * o_all is [vd] for this token and is overwritten in place by the scale. */
+static void linear_finish(const rmodel *m, int L, const float *xn,
+                          float *o_all, float *x_acc) {
+    const ornith_arch *a = &m->a;
+    int H = a->hidden_size, nv = a->lin_value_heads;
+    int dv = a->lin_value_head_dim, dk = a->lin_key_head_dim, vd = lin_vd(a);
+    ot_scale_(o_all, 1.0f / sqrtf((float)dk), vd);
+    float *gate = malloc((size_t)vd*sizeof(float));
+    matvec_q(m, Tb(m, L, "attn_gate.weight"), xn, gate);
+    ot_silu_(gate, vd);
+    float *o = malloc((size_t)vd*sizeof(float));
+    const float *snorm = f32(Tb(m, L, "ssm_norm.weight"));
+    for (int hv = 0; hv < nv; hv++)
+        ot_rmsnorm(o_all + (size_t)hv*dv, snorm, o + (size_t)hv*dv, dv,
+                   a->rms_norm_eps);
+    ot_mul_(o, gate, vd);
+    float *outp = malloc((size_t)H*sizeof(float));
+    matvec_q(m, Tb(m, L, "ssm_out.weight"), o, outp);
+    ot_add_(x_acc, outp, H);
+    free(gate); free(o); free(outp);
+}
+
 /* dense SwiGLU FFN (pre-norm = post_attention_norm), accumulate into x. */
 static void ffn_dense(const rmodel *m, int L, const float *x, float *x_acc) {
     const ornith_arch *a = &m->a;
@@ -261,7 +297,7 @@ static void full_attn(const rmodel *m, rstate *s, int L,
 static void linear_attn(const rmodel *m, rstate *s, int L,
                         const float *xn, float *x_acc) {
     const ornith_arch *a = &m->a;
-    int H=a->hidden_size, nk=a->lin_key_heads, nv=a->lin_value_heads;
+    int nk=a->lin_key_heads, nv=a->lin_value_heads;
     int dk=a->lin_key_head_dim, dv=a->lin_value_head_dim;
     int qd=lin_qd(a), vd=lin_vd(a), Cc=lin_cc_(a), group=nv/nk;
 
@@ -300,25 +336,186 @@ static void linear_attn(const rmodel *m, rstate *s, int L,
                           v + (size_t)hv*dv, alpha, ot_sigmoid(b_in[hv]),
                           o_all + (size_t)hv*dv);
     }
-    /* scale the delta output by 1/sqrt(head_dim) BEFORE the gated RMSNorm — this
-     * is NOT a no-op: the gated norm's eps regularizes small-magnitude heads, so
-     * the absolute scale matters (matches llama.cpp ggml_gated_delta_net). */
-    ot_scale_(o_all, 1.0f / sqrtf((float)dk), vd);
-    /* gated RMSNorm (Qwen3NextRMSNormGated): per-head RMSNorm with ssm_norm
-     * weight, THEN multiply by SiLU(gate), then out-projection. */
-    float *gate = malloc((size_t)vd*sizeof(float));
-    matvec_q(m, Tb(m, L, "attn_gate.weight"), xn, gate);
-    ot_silu_(gate, vd);
-    float *o = malloc((size_t)vd*sizeof(float));
-    const float *snorm = f32(Tb(m, L, "ssm_norm.weight"));
-    for (int hv = 0; hv < nv; hv++)
-        ot_rmsnorm(o_all + (size_t)hv*dv, snorm, o + (size_t)hv*dv, dv, a->rms_norm_eps);
-    ot_mul_(o, gate, vd);
-    float *outp = malloc((size_t)H*sizeof(float));
-    matvec_q(m, Tb(m, L, "ssm_out.weight"), o, outp);
-    ot_add_(x_acc, outp, H);
+    /* gated RMSNorm + SiLU gate + out-projection (shared with prefill). */
+    linear_finish(m, L, xn, o_all, x_acc);
     free(cat); free(conv); free(qn); free(kn); free(a_in); free(b_in);
-    free(o_all); free(gate); free(o); free(outp);
+    free(o_all);
+}
+
+/* ======================================================================= */
+/*  Whole-prompt prefill (batched projections; chunked scan for SSM layers) */
+/* ======================================================================= */
+
+/* Full-attention prefill: identical math to T sequential decode steps (each
+ * token's K,V is appended and it attends causally over the cache), but the
+ * projections and the output projection are batched matvecs. `base` is the
+ * starting position for RoPE (== s->pos at entry). */
+static void full_attn_prefill(const rmodel *m, rstate *s, int L,
+                              const float *XN, int T, int base, float *X_acc) {
+    const ornith_arch *a = &m->a;
+    int H=a->hidden_size, nh=a->num_attn_heads, nkv=a->num_kv_heads, hd=a->head_dim;
+    int qd=nh*hd, kvd=nkv*hd, qp=2*qd;
+    float *QP = malloc((size_t)T*qp*sizeof(float));
+    float *K  = malloc((size_t)T*kvd*sizeof(float));
+    float *Vv = malloc((size_t)T*kvd*sizeof(float));
+    matmul_batch_q(m, Tb(m, L, "attn_q.weight"), XN, QP, T);
+    matmul_batch_q(m, Tb(m, L, "attn_k.weight"), XN, K,  T);
+    matmul_batch_q(m, Tb(m, L, "attn_v.weight"), XN, Vv, T);
+    const float *qn = f32(Tb(m, L, "attn_q_norm.weight"));
+    const float *kn = f32(Tb(m, L, "attn_k_norm.weight"));
+    float *q = malloc((size_t)qd*sizeof(float));
+    float *G = malloc((size_t)T*qd*sizeof(float));   /* per-token output gates */
+    float *O = malloc((size_t)T*qd*sizeof(float));
+    for (int t = 0; t < T; t++) {
+        int pos = base + t;
+        const float *qpt = QP + (size_t)t*qp;
+        float *gt = G + (size_t)t*qd;
+        for (int h = 0; h < nh; h++) {
+            memcpy(q  + (size_t)h*hd, qpt + (size_t)h*2*hd,      (size_t)hd*sizeof(float));
+            memcpy(gt + (size_t)h*hd, qpt + (size_t)h*2*hd + hd, (size_t)hd*sizeof(float));
+        }
+        for (int h = 0; h < nh; h++) {
+            float *vh = q + (size_t)h*hd;
+            ot_rmsnorm(vh, qn, vh, hd, a->rms_norm_eps);
+            ot_rope_partial(vh, hd, a->rope_dim, pos, a->rope_theta);
+        }
+        float *kt = K + (size_t)t*kvd;
+        for (int h = 0; h < nkv; h++) {
+            float *vh = kt + (size_t)h*hd;
+            ot_rmsnorm(vh, kn, vh, hd, a->rms_norm_eps);
+            ot_rope_partial(vh, hd, a->rope_dim, pos, a->rope_theta);
+        }
+        ornith_gqa_step(&s->kv[L], q, kt, Vv + (size_t)t*kvd, nh,
+                        O + (size_t)t*qd, 0.0f);
+    }
+    for (size_t i = 0; i < (size_t)T*qd; i++) O[i] *= ot_sigmoid(G[i]);
+    float *OUTP = malloc((size_t)T*H*sizeof(float));
+    matmul_batch_q(m, Tb(m, L, "attn_output.weight"), O, OUTP, T);
+    for (int t = 0; t < T; t++) ot_add_(X_acc + (size_t)t*H, OUTP + (size_t)t*H, H);
+    free(QP); free(K); free(Vv); free(q); free(G); free(O); free(OUTP);
+}
+
+/* Linear (SSM gated-delta-net) prefill via the chunked parallel-scan. The conv
+ * and the delta recurrence advance their state across the whole prompt exactly
+ * as T decode steps would (conv_prefill == T conv_steps; delta_prefill == T
+ * delta_steps within fp tolerance). Gating is computed with the SAME helpers as
+ * decode (decay_alpha, ot_sigmoid, ot_l2norm_eps, kh = hv % nk). */
+static void linear_attn_prefill(const rmodel *m, rstate *s, int L,
+                                const float *XN, int T, int chunk, float *X_acc) {
+    const ornith_arch *a = &m->a;
+    int H=a->hidden_size, nk=a->lin_key_heads, nv=a->lin_value_heads;
+    int dk=a->lin_key_head_dim, dv=a->lin_value_head_dim, Cc=lin_cc_(a);
+    int qd=lin_qd(a), vd=lin_vd(a);
+
+    /* fused qkv projection over the whole prompt, then causal conv + SiLU */
+    float *CAT  = malloc((size_t)T*Cc*sizeof(float));
+    matmul_batch_q(m, Tb(m, L, "attn_qkv.weight"), XN, CAT, T);
+    float *CONV = malloc((size_t)T*Cc*sizeof(float));
+    ornith_conv_prefill(&s->conv[L], CAT, f32(Tb(m, L, "ssm_conv1d.weight")),
+                        NULL, T, CONV);
+    ot_silu_(CONV, (int)((size_t)T*Cc));
+
+    /* gating projections over the whole prompt */
+    float *A = malloc((size_t)T*nv*sizeof(float));
+    float *B = malloc((size_t)T*nv*sizeof(float));
+    matmul_batch_q(m, Tb(m, L, "ssm_alpha.weight"), XN, A, T);
+    matmul_batch_q(m, Tb(m, L, "ssm_beta.weight"),  XN, B, T);
+    const float *A_log = f32(Tb(m, L, "ssm_a"));
+    const float *dtb   = f32(Tb(m, L, "ssm_dt.bias"));
+
+    /* per value-head chunked delta scan */
+    float *Qh   = malloc((size_t)T*dk*sizeof(float));
+    float *Kh   = malloc((size_t)T*dk*sizeof(float));
+    float *Vh   = malloc((size_t)T*dv*sizeof(float));
+    float *al   = malloc((size_t)T*sizeof(float));
+    float *be   = malloc((size_t)T*sizeof(float));
+    float *Oh   = malloc((size_t)T*dv*sizeof(float));
+    float *O_all= malloc((size_t)T*vd*sizeof(float));
+    for (int hv = 0; hv < nv; hv++) {
+        int kh = hv % nk;   /* k-heads repeated/tiled onto v-heads (llama.cpp) */
+        for (int t = 0; t < T; t++) {
+            const float *q = CONV + (size_t)t*Cc + kh*dk;
+            const float *k = CONV + (size_t)t*Cc + qd + kh*dk;
+            const float *v = CONV + (size_t)t*Cc + 2*qd + hv*dv;
+            ot_l2norm_eps(q, Qh + (size_t)t*dk, dk, 1e-6f);
+            ot_l2norm_eps(k, Kh + (size_t)t*dk, dk, 1e-6f);
+            memcpy(Vh + (size_t)t*dv, v, (size_t)dv*sizeof(float));
+            al[t] = decay_alpha(A[(size_t)t*nv + hv], A_log[hv], dtb[hv]);
+            be[t] = ot_sigmoid(B[(size_t)t*nv + hv]);
+        }
+        ornith_delta_state st = { s->delta_S[L] + (size_t)hv*dv*dk, dk, dv };
+        ornith_delta_prefill(&st, Qh, Kh, Vh, al, be, T, chunk, Oh);
+        for (int t = 0; t < T; t++)
+            memcpy(O_all + (size_t)t*vd + hv*dv, Oh + (size_t)t*dv,
+                   (size_t)dv*sizeof(float));
+    }
+    for (int t = 0; t < T; t++)
+        linear_finish(m, L, XN + (size_t)t*H, O_all + (size_t)t*vd,
+                      X_acc + (size_t)t*H);
+
+    free(CAT); free(CONV); free(A); free(B);
+    free(Qh); free(Kh); free(Vh); free(al); free(be); free(Oh); free(O_all);
+}
+
+/* Dense SwiGLU FFN over T tokens (batched matvecs). X and X_acc are the same
+ * residual buffer; equals T calls to ffn_dense. */
+static void ffn_dense_prefill(const rmodel *m, int L, const float *X, int T,
+                              float *X_acc) {
+    const ornith_arch *a = &m->a;
+    int H = a->hidden_size, I = a->shared_inter_size;
+    const float *pn = f32(Tb(m, L, "post_attention_norm.weight"));
+    float *XN = malloc((size_t)T*H*sizeof(float));
+    for (int t = 0; t < T; t++)
+        ot_rmsnorm(X + (size_t)t*H, pn, XN + (size_t)t*H, H, a->rms_norm_eps);
+    float *Gp = malloc((size_t)T*I*sizeof(float));
+    float *Up = malloc((size_t)T*I*sizeof(float));
+    matmul_batch_q(m, Tb(m, L, "ffn_gate.weight"), XN, Gp, T);
+    matmul_batch_q(m, Tb(m, L, "ffn_up.weight"),   XN, Up, T);
+    for (size_t i = 0; i < (size_t)T*I; i++) Gp[i] = ot_silu1(Gp[i]) * Up[i];
+    float *O = malloc((size_t)T*H*sizeof(float));
+    matmul_batch_q(m, Tb(m, L, "ffn_down.weight"), Gp, O, T);
+    for (int t = 0; t < T; t++) ot_add_(X_acc + (size_t)t*H, O + (size_t)t*H, H);
+    free(XN); free(Gp); free(Up); free(O);
+}
+
+/* Prefill the whole prompt layer-by-layer. Linear layers use the chunked
+ * parallel-scan; full-attention layers use the (batched) sequential pass.
+ * Writes the final-position logits into `logits` if non-NULL. Numerically
+ * equal (within fp tolerance) to feeding the tokens one at a time through
+ * rforward_token, because tokens interact only through the sequential conv /
+ * delta / KV state, which is built in token order either way. */
+static void rforward_prefill(rmodel *m, rstate *s, const int32_t *tokens,
+                             int nt, int chunk, float *logits) {
+    const ornith_arch *a = &m->a;
+    int H = a->hidden_size;
+    int base = s->pos;
+    const ogguf_ltensor *embd = T(m, "token_embd.weight");
+    float *X  = malloc((size_t)nt*H*sizeof(float));
+    float *XN = malloc((size_t)nt*H*sizeof(float));
+    for (int t = 0; t < nt; t++)
+        embed_row(embd, tokens[t], X + (size_t)t*H, H);
+
+    for (int L = 0; L < a->num_layers; L++) {
+        const float *an = f32(Tb(m, L, "attn_norm.weight"));
+        for (int t = 0; t < nt; t++)
+            ot_rmsnorm(X + (size_t)t*H, an, XN + (size_t)t*H, H, a->rms_norm_eps);
+        if (ornith_layer_is_full_attn(a, L))
+            full_attn_prefill(m, s, L, XN, nt, base, X);
+        else
+            linear_attn_prefill(m, s, L, XN, nt, chunk, X);
+        ffn_dense_prefill(m, L, X, nt, X);
+    }
+    s->pos = base + nt;
+
+    if (logits) {
+        const ogguf_ltensor *onorm = T(m, "output_norm.weight");
+        const ogguf_ltensor *ohead = T(m, "output.weight");
+        float *xn = malloc((size_t)H*sizeof(float));
+        ot_rmsnorm(X + (size_t)(nt-1)*H, f32(onorm), xn, H, a->rms_norm_eps);
+        matvec_q(m, ohead, xn, logits);
+        free(xn);
+    }
+    free(X); free(XN);
 }
 
 /* One token through the whole stack. If logits != NULL, also computes the
@@ -414,6 +611,37 @@ const otokenizer  *rmodel_tokenizer(const rmodel *m) { return &m->tok; }
 
 /* ---- generation -------------------------------------------------------- */
 
+/* Prompt prefill dispatch. Default: the chunked parallel-scan path (linear
+ * layers use ornith_delta_prefill / ornith_conv_prefill). Set
+ * ORNITH_PREFILL_SERIAL=1 to fall back to the old token-by-token recurrence
+ * (for A/B parity checks). Set ORNITH_PROFILE to log prefill timing. Only the
+ * last prompt position needs logits. */
+static void rprefill(rmodel *m, rstate *s, const int32_t *toks, int np,
+                     float *logits) {
+    const char *serial = getenv("ORNITH_PREFILL_SERIAL");
+    int use_serial = serial && serial[0] == '1';
+    int prof = getenv("ORNITH_PROFILE") != NULL;
+    struct timespec t0, t1;
+    if (prof) clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (use_serial) {
+        for (int i = 0; i < np; i++)
+            rforward_token(m, s, toks[i], (i == np - 1) ? logits : NULL);
+    } else {
+        rforward_prefill(m, s, toks, np, RFWD_PREFILL_CHUNK, logits);
+    }
+    if (prof) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = (t1.tv_sec - t0.tv_sec) * 1e3 +
+                    (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        fprintf(stderr, "[profile] prefill %d tok %s: %.1f ms (%.3f ms/tok)\n",
+                np, use_serial ? "serial" : "chunked", ms, ms / np);
+        if (logits)
+            fprintf(stderr, "[profile] last-pos argmax token=%d logit=%.6f\n",
+                    argmax_f(logits, m->a.vocab_size),
+                    logits[argmax_f(logits, m->a.vocab_size)]);
+    }
+}
+
 ornith_status rmodel_generate(rmodel *m, const char *prompt, int n_predict,
                               FILE *out) {
     const ornith_arch *a = &m->a;
@@ -429,9 +657,8 @@ ornith_status rmodel_generate(rmodel *m, const char *prompt, int n_predict,
     fprintf(out, "%s", prompt);
     fflush(out);
 
-    /* prefill: run all prompt tokens; only the last needs logits */
-    for (int i = 0; i < np; i++)
-        rforward_token(m, s, ptoks[i], (i == np - 1) ? logits : NULL);
+    /* prefill: chunked parallel-scan for linear layers (last pos -> logits) */
+    rprefill(m, s, ptoks, np, logits);
 
     char piece[256];
     int32_t next = argmax_f(logits, V);
@@ -466,9 +693,8 @@ ornith_status rmodel_generate_ids(rmodel *m,
     float *logits = malloc((size_t)V * sizeof(float));
     if (!logits) { rstate_free(s); ornith_set_error("oom"); return ORNITH_ERR_OOM; }
 
-    /* prefill: only the last prompt token needs logits */
-    for (int i = 0; i < n_prompt; i++)
-        rforward_token(m, s, prompt_ids[i], (i == n_prompt - 1) ? logits : NULL);
+    /* prefill: chunked parallel-scan for linear layers (last pos -> logits) */
+    rprefill(m, s, prompt_ids, n_prompt, logits);
 
     int finish = 1;  /* default: hit the length cap */
     char piece[512];
