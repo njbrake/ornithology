@@ -428,6 +428,112 @@ static int cmd_generate(const char *path, const char *prompt, int n_predict,
     return s == ORNITH_OK ? 0 : 1;
 }
 
+/* Stream a generated token's bytes to stdout (session generate callback). */
+static void session_stream_cb(int32_t id, const char *piece, void *ud) {
+    (void)id; (void)ud;
+    fwrite(piece, 1, strlen(piece), stdout);
+    fflush(stdout);
+}
+
+/* True if `path` exists and is readable. */
+static bool file_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
+/* Real-weight generation with a persistent KV session on disk: load the
+ * snapshot if `session_path` exists (resuming WITHOUT re-prefilling the prompt
+ * already seen), feed only the new prompt, generate, then save the updated
+ * state back. A second run with the same --session continues from where the
+ * first left off. */
+static int cmd_generate_session(const char *path, const char *prompt,
+                                int n_predict, const osample_params *sp,
+                                const char *session_path) {
+    rmodel *m = NULL;
+    ornith_status s = rmodel_load(path, &m);
+    if (s != ORNITH_OK) {
+        fprintf(stderr, "run: load failed: %s\n", ornith_last_error());
+        return 1;
+    }
+    const ornith_arch *a = rmodel_arch(m);
+    const otokenizer *tok = rmodel_tokenizer(m);
+
+    /* tokenize the (new) prompt; for a resumed session this is only the
+     * continuation, never the original prefix. */
+    int32_t *ptoks = NULL; int np = 0;
+    if (prompt && prompt[0]) otok_encode(tok, prompt, &ptoks, &np);
+
+    rsession *sess = NULL;
+    bool resumed = false;
+    if (file_exists(session_path)) {
+        s = rmodel_session_load(m, session_path, np + n_predict + 8, &sess);
+        if (s != ORNITH_OK) {
+            fprintf(stderr, "run: session load failed: %s\n", ornith_last_error());
+            free(ptoks); rmodel_free(m);
+            return 1;
+        }
+        resumed = true;
+        fprintf(stderr,
+                "resumed session %s: %d cached tokens (no re-prefill of the "
+                "original prompt)\n", session_path, rmodel_session_pos(sess));
+    } else {
+        sess = rmodel_session_new(m, np + n_predict + 8);
+        if (!sess) {
+            fprintf(stderr, "run: session alloc failed: %s\n", ornith_last_error());
+            free(ptoks); rmodel_free(m);
+            return 1;
+        }
+        fprintf(stderr, "new session %s\n", session_path);
+    }
+
+    fprintf(stderr,
+            "loaded %s: hidden %d, %d layers (%d full-attn), vocab %d, eos %d\n",
+            path, a->hidden_size, a->num_layers,
+            ornith_count_full_attn_layers(a), a->vocab_size, a->eos_token_id);
+
+    /* feed the new prompt (only the continuation when resuming) */
+    if (np > 0) {
+        s = rmodel_session_eval(sess, ptoks, np);
+        if (s != ORNITH_OK) {
+            fprintf(stderr, "run: eval failed: %s\n", ornith_last_error());
+            free(ptoks); rmodel_session_free(sess); rmodel_free(m);
+            return 1;
+        }
+    } else if (!resumed) {
+        fprintf(stderr, "run: a new session needs a --prompt\n");
+        free(ptoks); rmodel_session_free(sess); rmodel_free(m);
+        return 1;
+    }
+
+    int sampling = sp && sp->temperature > 0.0f;
+    fprintf(stderr, "generating %d tokens (%s)...\n\n", n_predict,
+            sampling ? "sampling" : "greedy");
+    if (prompt && prompt[0]) { fputs(prompt, stdout); fflush(stdout); }
+
+    int finish = 0;
+    s = rmodel_session_generate(sess, n_predict, NULL, 0,
+                                sampling ? sp : NULL,
+                                session_stream_cb, NULL, &finish);
+    fputc('\n', stdout);
+    if (s != ORNITH_OK) {
+        fprintf(stderr, "run: generation failed: %s\n", ornith_last_error());
+        free(ptoks); rmodel_session_free(sess); rmodel_free(m);
+        return 1;
+    }
+
+    s = rmodel_session_save(sess, session_path);
+    if (s != ORNITH_OK)
+        fprintf(stderr, "run: session save failed: %s\n", ornith_last_error());
+    else
+        fprintf(stderr, "saved session %s (pos=%d)\n", session_path,
+                rmodel_session_pos(sess));
+
+    free(ptoks); rmodel_session_free(sess); rmodel_free(m);
+    return s == ORNITH_OK ? 0 : 1;
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
         "ornithology %s\n\n"
@@ -440,9 +546,13 @@ static void usage(const char *argv0) {
         "  %s imatrix <model.gguf> <corpus.txt> [-o imatrix.dat] [--chunks N]\n"
         "        collect an importance matrix over a calibration corpus\n"
         "  %s run [--prompt TEXT] [-n N] [--temp T] [--top-p P] [--top-k K]\n"
-        "         [--min-p M] [--repeat-penalty R] [--seed S] [--kv-q8] <model.gguf>\n"
+        "         [--min-p M] [--repeat-penalty R] [--seed S] [--kv-q8]\n"
+        "         [--session FILE] <model.gguf>\n"
         "        with --prompt: real-weight generation (default N=32);\n"
         "        default greedy (--temp 0); --temp>0 enables sampling;\n"
+        "        --session FILE: persist/resume the KV cache — load it if it\n"
+        "          exists (resume without re-prefilling the prompt) and save the\n"
+        "          updated state back after generating;\n"
         "        without --prompt: inspect + dequant check + synthetic self-test\n"
         "  %s serve [--host H] [--port P] <model.gguf>\n"
         "        OpenAI/Anthropic-compatible HTTP server (default 127.0.0.1:8080)\n"
@@ -514,11 +624,12 @@ int main(int argc, char **argv) {
         return cmd_imatrix(model, corpus, out, max_chunks);
     }
     if (!strcmp(cmd, "run")) {
-        const char *path = NULL, *prompt = NULL;
+        const char *path = NULL, *prompt = NULL, *session = NULL;
         int n_predict = 32;
         osample_params sp = osample_params_default();  /* greedy by default */
         for (int i = 2; i < argc; i++) {
             if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
+            else if (!strcmp(argv[i], "--session") && i + 1 < argc) session = argv[++i];
             else if ((!strcmp(argv[i], "-n") || !strcmp(argv[i], "--n-predict"))
                      && i + 1 < argc) n_predict = atoi(argv[++i]);
             else if ((!strcmp(argv[i], "--temp") || !strcmp(argv[i], "--temperature"))
@@ -539,6 +650,8 @@ int main(int argc, char **argv) {
             else path = argv[i];
         }
         if (!path) { usage(argv[0]); return 1; }
+        if (session)
+            return cmd_generate_session(path, prompt, n_predict, &sp, session);
         if (prompt) return cmd_generate(path, prompt, n_predict, &sp);
         return cmd_run(path);   /* no prompt: inspect + synthetic self-test */
     }

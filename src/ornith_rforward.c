@@ -229,13 +229,29 @@ static int kv_q8_enabled(void) {
     return e && e[0] && e[0] != '0';
 }
 
-static rstate *rstate_new(const ornith_arch *a, int cap) {
+/* Allocate the rstate container and its per-layer arrays, but leave the
+ * individual KV caches / conv states / delta states uninitialized (zeroed). The
+ * caller fills them (rstate_new for a fresh run; the loader for a restore).
+ * rstate_free is safe on a partially-initialized skeleton (freeing zeroed
+ * structs / NULL pointers is a no-op). */
+static rstate *rstate_skeleton(const ornith_arch *a) {
     rstate *s = calloc(1, sizeof(*s));
+    if (!s) return NULL;
     s->a = a; s->pos = 0;
-    int kv_q8 = kv_q8_enabled();
     s->kv = calloc((size_t)a->num_layers, sizeof(ornith_kv_cache));
     s->conv = calloc((size_t)a->num_layers, sizeof(ornith_conv_state));
     s->delta_S = calloc((size_t)a->num_layers, sizeof(float *));
+    if (!s->kv || !s->conv || !s->delta_S) {
+        free(s->kv); free(s->conv); free(s->delta_S); free(s);
+        return NULL;
+    }
+    return s;
+}
+
+static rstate *rstate_new(const ornith_arch *a, int cap) {
+    rstate *s = rstate_skeleton(a);
+    if (!s) return NULL;
+    int kv_q8 = kv_q8_enabled();
     int dk=a->lin_key_head_dim, dv=a->lin_value_head_dim, nv=a->lin_value_heads;
     for (int L = 0; L < a->num_layers; L++) {
         if (ornith_layer_is_full_attn(a, L))
@@ -874,45 +890,319 @@ static int32_t rpick(const float *logits, int V, const osample_params *sp,
     return osample(scratch, V, sp, rng, hist, nhist);
 }
 
+/* ---- persistent / resumable sessions ----------------------------------- */
+
+/* A session owns the recurrent/KV state for one sequence plus the bookkeeping
+ * needed to (a) drive the repeat penalty and (b) snapshot/restore: the token
+ * prefix consumed so far and the next-token logits at the current position. */
+struct rsession {
+    rmodel  *m;
+    rstate  *st;
+    int      cap;          /* max total positions (KV capacity)              */
+    int32_t *hist;         /* [cap] token prefix (prompt + generated so far) */
+    int      nhist;
+    float   *logits;       /* [vocab] next-token logits, valid iff have_logits */
+    int      have_logits;
+};
+
+rsession *rmodel_session_new(rmodel *m, int cap) {
+    if (cap < 1) cap = 1;
+    rsession *s = calloc(1, sizeof(*s));
+    if (!s) { ornith_set_error("oom"); return NULL; }
+    s->m = m; s->cap = cap;
+    s->st     = rstate_new(&m->a, cap);
+    s->hist   = malloc((size_t)cap * sizeof(int32_t));
+    s->logits = malloc((size_t)m->a.vocab_size * sizeof(float));
+    if (!s->st || !s->hist || !s->logits) {
+        rmodel_session_free(s); ornith_set_error("oom"); return NULL;
+    }
+    return s;
+}
+
+void rmodel_session_free(rsession *s) {
+    if (!s) return;
+    if (s->st) rstate_free(s->st);
+    free(s->hist); free(s->logits); free(s);
+}
+
+const float *rmodel_session_logits(const rsession *s) {
+    return (s && s->have_logits) ? s->logits : NULL;
+}
+int rmodel_session_pos(const rsession *s) { return s ? s->st->pos : 0; }
+
+ornith_status rmodel_session_eval(rsession *s, const int32_t *tokens, int n) {
+    if (n <= 0) return ORNITH_OK;
+    if (s->st->pos + n > s->cap) {
+        ornith_set_error("session capacity %d exceeded (pos %d + %d tokens)",
+                         s->cap, s->st->pos, n);
+        return ORNITH_ERR_UNSUPPORTED;
+    }
+    rprefill(s->m, s->st, tokens, n, s->logits);
+    s->have_logits = 1;
+    for (int i = 0; i < n && s->nhist < s->cap; i++) s->hist[s->nhist++] = tokens[i];
+    return ORNITH_OK;
+}
+
+ornith_status rmodel_session_generate(rsession *s, int n_predict,
+                                      const int32_t *stop_ids, int n_stop,
+                                      const osample_params *sp,
+                                      void (*on_token)(int32_t, const char *,
+                                                       void *),
+                                      void *ud, int *out_finish) {
+    rmodel *m = s->m; const ornith_arch *a = &m->a; int V = a->vocab_size;
+    if (!s->have_logits) {
+        ornith_set_error("session has no logits; eval a prompt or load first");
+        return ORNITH_ERR_FORMAT;
+    }
+    if (n_predict < 0) n_predict = 0;
+    float *scratch = sp ? malloc((size_t)V * sizeof(float)) : NULL;
+    if (sp && !scratch) { ornith_set_error("oom"); return ORNITH_ERR_OOM; }
+    ot_rng rng = ot_rng_seed(sp ? sp->seed : 0);
+
+    int finish = 1;            /* default: hit the length cap */
+    char piece[512];
+    int32_t next = rpick(s->logits, V, sp, &rng, s->hist, s->nhist, scratch);
+    for (int step = 0; step < n_predict; step++) {
+        int stop = (next == a->eos_token_id);
+        for (int k = 0; !stop && k < n_stop; k++)
+            if (next == stop_ids[k]) stop = 1;
+        if (stop) { finish = 0; break; }
+        if (s->st->pos >= s->cap) { finish = 1; break; }  /* out of room */
+
+        otok_detok_token(&m->tok, next, piece, sizeof(piece));
+        if (on_token) on_token(next, piece, ud);
+
+        if (s->nhist < s->cap) s->hist[s->nhist++] = next;
+        rforward_token(m, s->st, next, s->logits);
+        next = rpick(s->logits, V, sp, &rng, s->hist, s->nhist, scratch);
+    }
+    if (out_finish) *out_finish = finish;
+    free(scratch);
+    return ORNITH_OK;
+}
+
+/* ---- session serialization --------------------------------------------- */
+
+#define SESS_MAGIC   "ORNSESS\0"   /* 8 bytes incl. the trailing NUL        */
+#define SESS_VERSION 1u
+
+/* Arch fingerprint embedded in a snapshot so it can't be restored into a
+ * structurally different model. */
+typedef struct {
+    int32_t hidden, num_layers, num_attn_heads, num_kv_heads, head_dim;
+    int32_t full_attn_interval, lin_key_heads, lin_value_heads;
+    int32_t lin_key_head_dim, lin_value_head_dim, lin_conv_kernel;
+    int32_t n_routed_experts, vocab_size;
+} sess_fp;
+
+static void sess_fp_fill(sess_fp *fp, const ornith_arch *a) {
+    memset(fp, 0, sizeof(*fp));
+    fp->hidden = a->hidden_size; fp->num_layers = a->num_layers;
+    fp->num_attn_heads = a->num_attn_heads; fp->num_kv_heads = a->num_kv_heads;
+    fp->head_dim = a->head_dim; fp->full_attn_interval = a->full_attn_interval;
+    fp->lin_key_heads = a->lin_key_heads; fp->lin_value_heads = a->lin_value_heads;
+    fp->lin_key_head_dim = a->lin_key_head_dim;
+    fp->lin_value_head_dim = a->lin_value_head_dim;
+    fp->lin_conv_kernel = a->lin_conv_kernel;
+    fp->n_routed_experts = a->n_routed_experts; fp->vocab_size = a->vocab_size;
+}
+
+/* FNV-1a over the token prefix; the snapshot records which prefix it stands for. */
+static uint64_t sess_prefix_hash(const int32_t *t, int n) {
+    uint64_t h = 1469598103934665603ULL;
+    const uint8_t *p = (const uint8_t *)t;
+    for (size_t i = 0; i < (size_t)n * sizeof(int32_t); i++) {
+        h ^= p[i]; h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+ornith_status rmodel_session_save(const rsession *s, const char *path) {
+    const ornith_arch *a = &s->m->a;
+    FILE *f = fopen(path, "wb");
+    if (!f) { ornith_set_error("session save: cannot open %s", path); return ORNITH_ERR_IO; }
+
+    int ok = 1;
+    ok = ok && fwrite(SESS_MAGIC, 1, 8, f) == 8;
+    uint32_t ver = SESS_VERSION; ok = ok && fwrite(&ver, 4, 1, f) == 1;
+    sess_fp fp; sess_fp_fill(&fp, a);
+    ok = ok && fwrite(&fp, sizeof(fp), 1, f) == 1;
+    int32_t pos = s->st->pos, nhist = s->nhist, hl = s->have_logits;
+    uint64_t ph = sess_prefix_hash(s->hist, s->nhist);
+    ok = ok && fwrite(&pos, 4, 1, f) == 1;
+    ok = ok && fwrite(&nhist, 4, 1, f) == 1;
+    ok = ok && fwrite(&ph, 8, 1, f) == 1;
+    ok = ok && fwrite(&hl, 4, 1, f) == 1;
+
+    for (int L = 0; ok && L < a->num_layers; L++) {
+        if (ornith_layer_is_full_attn(a, L)) {
+            const ornith_kv_cache *c = &s->st->kv[L];
+            int32_t q = c->quantized, len = c->len,
+                    nkv = c->n_kv_heads, hd = c->head_dim;
+            ok = ok && fwrite(&q, 4, 1, f) == 1 && fwrite(&len, 4, 1, f) == 1
+                    && fwrite(&nkv, 4, 1, f) == 1 && fwrite(&hd, 4, 1, f) == 1;
+            size_t hv = (size_t)len * nkv * hd, scl = (size_t)len * nkv;
+            if (q) {
+                ok = ok && fwrite(c->Kq, 1, hv, f) == hv
+                        && fwrite(c->Vq, 1, hv, f) == hv
+                        && fwrite(c->Ks, sizeof(float), scl, f) == scl
+                        && fwrite(c->Vs, sizeof(float), scl, f) == scl;
+            } else {
+                ok = ok && fwrite(c->K, sizeof(float), hv, f) == hv
+                        && fwrite(c->V, sizeof(float), hv, f) == hv;
+            }
+        } else {
+            int nv = a->lin_value_heads, dv = a->lin_value_head_dim,
+                dk = a->lin_key_head_dim;
+            size_t ds = (size_t)nv * dv * dk;
+            ok = ok && fwrite(s->st->delta_S[L], sizeof(float), ds, f) == ds;
+            const ornith_conv_state *cv = &s->st->conv[L];
+            int32_t K = cv->K, C = cv->C;
+            size_t cb = (size_t)(cv->K > 0 ? cv->K - 1 : 0) * cv->C;
+            ok = ok && fwrite(&K, 4, 1, f) == 1 && fwrite(&C, 4, 1, f) == 1
+                    && fwrite(cv->buf, sizeof(float), cb, f) == cb;
+        }
+    }
+    if (ok && s->nhist > 0)
+        ok = ok && fwrite(s->hist, sizeof(int32_t), (size_t)s->nhist, f)
+                   == (size_t)s->nhist;
+    if (ok && s->have_logits)
+        ok = ok && fwrite(s->logits, sizeof(float), (size_t)a->vocab_size, f)
+                   == (size_t)a->vocab_size;
+
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) { ornith_set_error("session save: write to %s failed", path); return ORNITH_ERR_IO; }
+    return ORNITH_OK;
+}
+
+ornith_status rmodel_session_load(rmodel *m, const char *path, int extra_cap,
+                                  rsession **out) {
+    const ornith_arch *a = &m->a;
+    FILE *f = fopen(path, "rb");
+    if (!f) { ornith_set_error("session load: cannot open %s", path); return ORNITH_ERR_IO; }
+
+    char magic[8]; uint32_t ver;
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, SESS_MAGIC, 8) != 0) {
+        fclose(f); ornith_set_error("session load: not a session file"); return ORNITH_ERR_FORMAT;
+    }
+    if (fread(&ver, 4, 1, f) != 1 || ver != SESS_VERSION) {
+        fclose(f); ornith_set_error("session load: unsupported version"); return ORNITH_ERR_FORMAT;
+    }
+    sess_fp fp, cur; sess_fp_fill(&cur, a);
+    if (fread(&fp, sizeof(fp), 1, f) != 1) {
+        fclose(f); ornith_set_error("session load: truncated header"); return ORNITH_ERR_FORMAT;
+    }
+    if (memcmp(&fp, &cur, sizeof(fp)) != 0) {
+        fclose(f);
+        ornith_set_error("session load: arch fingerprint mismatch "
+                         "(snapshot is for a different model)");
+        return ORNITH_ERR_FORMAT;
+    }
+    int32_t pos, nhist, hl; uint64_t ph;
+    if (fread(&pos, 4, 1, f) != 1 || fread(&nhist, 4, 1, f) != 1 ||
+        fread(&ph, 8, 1, f) != 1 || fread(&hl, 4, 1, f) != 1) {
+        fclose(f); ornith_set_error("session load: truncated body"); return ORNITH_ERR_FORMAT;
+    }
+
+    int cap = pos + (extra_cap > 0 ? extra_cap : 0);
+    if (cap < pos)   cap = pos;
+    if (cap < nhist) cap = nhist;
+    if (cap < 1)     cap = 1;
+
+    rsession *s = calloc(1, sizeof(*s));
+    if (!s) { fclose(f); ornith_set_error("oom"); return ORNITH_ERR_OOM; }
+    s->m = m; s->cap = cap;
+    s->st     = rstate_skeleton(a);
+    s->hist   = malloc((size_t)cap * sizeof(int32_t));
+    s->logits = malloc((size_t)a->vocab_size * sizeof(float));
+    if (!s->st || !s->hist || !s->logits) {
+        fclose(f); rmodel_session_free(s); ornith_set_error("oom"); return ORNITH_ERR_OOM;
+    }
+
+    int ok = 1;
+    for (int L = 0; ok && L < a->num_layers; L++) {
+        if (ornith_layer_is_full_attn(a, L)) {
+            int32_t q, len, nkv, hd;
+            if (fread(&q, 4, 1, f) != 1 || fread(&len, 4, 1, f) != 1 ||
+                fread(&nkv, 4, 1, f) != 1 || fread(&hd, 4, 1, f) != 1) { ok = 0; break; }
+            if (nkv != a->num_kv_heads || hd != a->head_dim || len > cap) { ok = 0; break; }
+            if (ornith_kv_init_ex(&s->st->kv[L], cap, nkv, hd, q) != ORNITH_OK) { ok = 0; break; }
+            ornith_kv_cache *c = &s->st->kv[L];
+            c->len = len;
+            size_t hv = (size_t)len * nkv * hd, scl = (size_t)len * nkv;
+            if (q) {
+                ok = fread(c->Kq, 1, hv, f) == hv && fread(c->Vq, 1, hv, f) == hv
+                  && fread(c->Ks, sizeof(float), scl, f) == scl
+                  && fread(c->Vs, sizeof(float), scl, f) == scl;
+            } else {
+                ok = fread(c->K, sizeof(float), hv, f) == hv
+                  && fread(c->V, sizeof(float), hv, f) == hv;
+            }
+        } else {
+            int nv = a->lin_value_heads, dv = a->lin_value_head_dim,
+                dk = a->lin_key_head_dim;
+            size_t ds = (size_t)nv * dv * dk;
+            s->st->delta_S[L] = malloc(ds * sizeof(float));
+            if (!s->st->delta_S[L]) { ok = 0; break; }
+            if (fread(s->st->delta_S[L], sizeof(float), ds, f) != ds) { ok = 0; break; }
+            int32_t K, C;
+            if (fread(&K, 4, 1, f) != 1 || fread(&C, 4, 1, f) != 1) { ok = 0; break; }
+            if (ornith_conv_init(&s->st->conv[L], K, C) != ORNITH_OK) { ok = 0; break; }
+            size_t cb = (size_t)(K > 0 ? K - 1 : 0) * C;
+            if (fread(s->st->conv[L].buf, sizeof(float), cb, f) != cb) { ok = 0; break; }
+        }
+    }
+    if (ok && nhist > 0)
+        ok = fread(s->hist, sizeof(int32_t), (size_t)nhist, f) == (size_t)nhist;
+    if (ok && hl)
+        ok = fread(s->logits, sizeof(float), (size_t)a->vocab_size, f)
+             == (size_t)a->vocab_size;
+    fclose(f);
+
+    if (!ok) { rmodel_session_free(s); ornith_set_error("session load: truncated/corrupt"); return ORNITH_ERR_FORMAT; }
+    if (sess_prefix_hash(s->hist, nhist) != ph) {
+        rmodel_session_free(s);
+        ornith_set_error("session load: prefix hash mismatch (corrupt snapshot)");
+        return ORNITH_ERR_FORMAT;
+    }
+    s->st->pos = pos; s->nhist = nhist; s->have_logits = hl ? 1 : 0;
+    *out = s;
+    return ORNITH_OK;
+}
+
+/* ---- generation (over a transient session) ----------------------------- */
+
+/* Stream callback for rmodel_generate_s: write each token's bytes to a FILE. */
+struct ostream_ud { FILE *out; };
+static void ostream_cb(int32_t id, const char *piece, void *ud) {
+    (void)id;
+    struct ostream_ud *u = ud;
+    fwrite(piece, 1, strlen(piece), u->out);
+    fflush(u->out);
+}
+
 ornith_status rmodel_generate_s(rmodel *m, const char *prompt, int n_predict,
                                 const osample_params *sp, FILE *out) {
-    const ornith_arch *a = &m->a;
-    int V = a->vocab_size;
     int32_t *ptoks = NULL; int np = 0;
     otok_encode(&m->tok, prompt, &ptoks, &np);
     if (np == 0) { free(ptoks); ornith_set_error("empty prompt"); return ORNITH_ERR_FORMAT; }
     if (n_predict < 0) n_predict = 0;
 
-    int cap = np + n_predict + 4;
-    rstate *s = rstate_new(a, cap);
-    float *logits = malloc((size_t)V*sizeof(float));
-    float *scratch = sp ? malloc((size_t)V*sizeof(float)) : NULL;
-    /* recent-token history (prompt + generated) for the repeat penalty */
-    int32_t *hist = malloc((size_t)cap*sizeof(int32_t));
-    int nhist = 0;
-    for (int i = 0; i < np; i++) hist[nhist++] = ptoks[i];
-    ot_rng rng = ot_rng_seed(sp ? sp->seed : 0);
+    rsession *s = rmodel_session_new(m, np + n_predict + 4);
+    if (!s) { free(ptoks); return ORNITH_ERR_OOM; }
 
     fprintf(out, "%s", prompt);
     fflush(out);
 
-    /* prefill: chunked parallel-scan for linear layers (last pos -> logits) */
-    rprefill(m, s, ptoks, np, logits);
-
-    char piece[256];
-    int32_t next = rpick(logits, V, sp, &rng, hist, nhist, scratch);
-    for (int step = 0; step < n_predict; step++) {
-        if (next == a->eos_token_id) break;
-        size_t pl = otok_detok_token(&m->tok, next, piece, sizeof(piece));
-        fwrite(piece, 1, pl, out); fflush(out);
-        if (nhist < cap) hist[nhist++] = next;
-        rforward_token(m, s, next, logits);
-        next = rpick(logits, V, sp, &rng, hist, nhist, scratch);
+    ornith_status st = rmodel_session_eval(s, ptoks, np);
+    if (st == ORNITH_OK) {
+        struct ostream_ud ud = { out };
+        st = rmodel_session_generate(s, n_predict, NULL, 0, sp, ostream_cb, &ud, NULL);
     }
     fprintf(out, "\n");
 
-    free(ptoks); free(logits); free(scratch); free(hist); rstate_free(s);
-    return ORNITH_OK;
+    free(ptoks); rmodel_session_free(s);
+    return st;
 }
 
 ornith_status rmodel_generate(rmodel *m, const char *prompt, int n_predict,
@@ -928,49 +1218,18 @@ ornith_status rmodel_generate_ids_s(rmodel *m,
                                     void (*on_token)(int32_t id,
                                                      const char *piece, void *ud),
                                     void *ud, int *out_finish) {
-    const ornith_arch *a = &m->a;
-    int V = a->vocab_size;
     if (n_prompt <= 0) { ornith_set_error("empty prompt"); return ORNITH_ERR_FORMAT; }
     if (n_predict < 0) n_predict = 0;
 
-    int cap = n_prompt + n_predict + 4;
-    rstate *s = rstate_new(a, cap);
+    rsession *s = rmodel_session_new(m, n_prompt + n_predict + 4);
     if (!s) { ornith_set_error("oom"); return ORNITH_ERR_OOM; }
-    float *logits = malloc((size_t)V * sizeof(float));
-    if (!logits) { rstate_free(s); ornith_set_error("oom"); return ORNITH_ERR_OOM; }
-    float *scratch = sp ? malloc((size_t)V * sizeof(float)) : NULL;
-    int32_t *hist = malloc((size_t)cap * sizeof(int32_t));
-    if ((sp && !scratch) || !hist) {
-        free(logits); free(scratch); free(hist); rstate_free(s);
-        ornith_set_error("oom"); return ORNITH_ERR_OOM;
-    }
-    int nhist = 0;
-    for (int i = 0; i < n_prompt; i++) hist[nhist++] = prompt_ids[i];
-    ot_rng rng = ot_rng_seed(sp ? sp->seed : 0);
 
-    /* prefill: chunked parallel-scan for linear layers (last pos -> logits) */
-    rprefill(m, s, prompt_ids, n_prompt, logits);
-
-    int finish = 1;  /* default: hit the length cap */
-    char piece[512];
-    int32_t next = rpick(logits, V, sp, &rng, hist, nhist, scratch);
-    for (int step = 0; step < n_predict; step++) {
-        int stop = (next == a->eos_token_id);
-        for (int k = 0; !stop && k < n_stop; k++)
-            if (next == stop_ids[k]) stop = 1;
-        if (stop) { finish = 0; break; }
-
-        otok_detok_token(&m->tok, next, piece, sizeof(piece));
-        if (on_token) on_token(next, piece, ud);
-
-        if (nhist < cap) hist[nhist++] = next;
-        rforward_token(m, s, next, logits);
-        next = rpick(logits, V, sp, &rng, hist, nhist, scratch);
-    }
-
-    if (out_finish) *out_finish = finish;
-    free(logits); free(scratch); free(hist); rstate_free(s);
-    return ORNITH_OK;
+    ornith_status st = rmodel_session_eval(s, prompt_ids, n_prompt);
+    if (st == ORNITH_OK)
+        st = rmodel_session_generate(s, n_predict, stop_ids, n_stop, sp,
+                                     on_token, ud, out_finish);
+    rmodel_session_free(s);
+    return st;
 }
 
 ornith_status rmodel_generate_ids(rmodel *m,

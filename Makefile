@@ -104,7 +104,8 @@ cuda-spark: $(CORE_OBJ) $(CLI)
 # GOLDEN_TOP_TOKEN pins the tiny-model regression output (see test_forward.c).
 GOLDEN_TOP_TOKEN ?= 9
 TESTS := test_gguf test_quant test_imatrix test_qdot test_tensor test_attn \
-         test_moe test_forward test_tokenizer test_server test_sample test_agent
+         test_moe test_forward test_tokenizer test_server test_sample test_agent \
+         test_session
 
 test: $(CORE_OBJ)
 	@set -e; for t in $(TESTS); do \

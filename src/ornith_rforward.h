@@ -73,4 +73,60 @@ ornith_status rmodel_generate_ids_s(rmodel *m,
                                                      const char *piece, void *ud),
                                     void *ud, int *out_finish);
 
+/* ---- persistent / resumable sessions (on-disk KV cache) ---------------- *
+ *
+ * A `rsession` wraps the full per-sequence recurrent state (every full-attn
+ * layer's KV cache, every linear layer's gated-delta state + conv state, and
+ * the stream position) for one chat/sequence on one model. It can be fed tokens
+ * incrementally, saved to disk, and later restored into a fresh session so a
+ * conversation resumes WITHOUT re-prefilling the prompt that was already seen.
+ *
+ * The on-disk snapshot carries an arch fingerprint (hidden/layers/heads/...)
+ * and a hash of the token prefix it represents, so it can't be loaded into a
+ * mismatched model. fp32 and Q8 (ORNITH_KV_Q8) KV caches both round-trip
+ * exactly: the saved bytes are the cache's exact contents, so a restored
+ * session produces bit-identical next-token logits to the original.
+ *
+ * rmodel_generate* still work unchanged; they now run over a transient session
+ * internally. */
+typedef struct rsession rsession;
+
+/* New empty session on `m` with room for up to `cap` total positions (prompt +
+ * generated). Returns NULL on OOM. */
+rsession *rmodel_session_new(rmodel *m, int cap);
+void      rmodel_session_free(rsession *s);
+
+/* Feed `n` tokens, advancing the recurrent/KV state from the current position
+ * and computing the next-token logits (retrievable via rmodel_session_logits).
+ * n == 0 is a no-op that keeps any existing logits. Fails if it would exceed the
+ * session capacity. */
+ornith_status rmodel_session_eval(rsession *s, const int32_t *tokens, int n);
+
+/* Logits for the next token after the most recent eval/generate (V entries), or
+ * NULL if nothing has been fed yet. The buffer is owned by the session. */
+const float *rmodel_session_logits(const rsession *s);
+
+/* Current stream position (number of tokens consumed). */
+int rmodel_session_pos(const rsession *s);
+
+/* Serialize the whole session (all layers' state + position + token prefix +
+ * the next-token logits) to `path`, and restore it into a fresh session. On
+ * load, the session capacity is (saved position + `extra_cap`) so the caller can
+ * keep generating; pass extra_cap for the tokens still to come. */
+ornith_status rmodel_session_save(const rsession *s, const char *path);
+ornith_status rmodel_session_load(rmodel *m, const char *path, int extra_cap,
+                                  rsession **out);
+
+/* Greedily/sampled decode up to `n_predict` tokens starting from the session's
+ * current next-token logits (so eval a prompt, or load a session, first).
+ * Semantics mirror rmodel_generate_ids_s: stop (without emitting) on eos or any
+ * id in stop_ids; `*out_finish` is 1 on the length cap, 0 on stop/eos. */
+ornith_status rmodel_session_generate(rsession *s, int n_predict,
+                                      const int32_t *stop_ids, int n_stop,
+                                      const osample_params *sp,
+                                      void (*on_token)(int32_t id,
+                                                       const char *piece,
+                                                       void *ud),
+                                      void *ud, int *out_finish);
+
 #endif /* ORNITH_RFORWARD_H */
