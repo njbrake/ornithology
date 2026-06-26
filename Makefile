@@ -26,7 +26,11 @@ CORE := \
   $(SRC_DIR)/ornith_json.c \
   $(SRC_DIR)/ornith_config.c \
   $(SRC_DIR)/ornith_gguf.c \
-  $(SRC_DIR)/ornith_model.c
+  $(SRC_DIR)/ornith_model.c \
+  $(SRC_DIR)/ornith_tensor.c \
+  $(SRC_DIR)/ornith_attn.c \
+  $(SRC_DIR)/ornith_moe.c \
+  $(SRC_DIR)/ornith_forward.c
 
 CLI  := $(SRC_DIR)/ornith.c
 
@@ -67,11 +71,20 @@ cuda-spark: $(CORE_OBJ) $(CLI)
 	nvcc -O2 -arch=sm_121a -I$(SRC_DIR) -DORNITH_BACKEND_CUDA \
 	  $(SRC_DIR)/ornith_cuda.cu $(CORE_OBJ) $(CLI) -lm -o ornith
 
-# Test suite (CPU only).
+# Test suite (CPU only). Each test file is its own binary; all must pass.
+# GOLDEN_TOP_TOKEN pins the tiny-model regression output (see test_forward.c).
+GOLDEN_TOP_TOKEN ?= 4
+TESTS := test_gguf test_tensor test_attn test_moe test_forward
+
 test: $(CORE_OBJ)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_gguf.c $(CORE_OBJ) \
-	  $(LIBS) -o $(BUILD)/test_gguf
-	./$(BUILD)/test_gguf
+	@set -e; for t in $(TESTS); do \
+	  echo "=== building $$t ==="; \
+	  $(CC) $(CFLAGS) -DGOLDEN_TOP_TOKEN=$(GOLDEN_TOP_TOKEN) -I$(SRC_DIR) \
+	    tests/$$t.c $(CORE_OBJ) $(LIBS) -o $(BUILD)/$$t; \
+	  echo "=== running $$t ==="; \
+	  ./$(BUILD)/$$t; \
+	done
+	@echo "all test binaries passed"
 
 clean:
 	rm -rf $(BUILD) ornith
