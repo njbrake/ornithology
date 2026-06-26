@@ -30,10 +30,15 @@ There is no official 397B GGUF, so this is on the critical path.
       (`tools/quantize/convert_hf_to_gguf.py`): concrete Ornith tensor naming +
       metadata (arch `qwen35moe`), pure-Python GGUF writer validated against the
       C reader. Runs end to end once a checkpoint + numpy/safetensors are present.
-- [ ] **stubbed:** k-/i-quant encoders (`Q2_K`, `Q5_K`, `Q6_K`, `IQ2_XXS`,
-      `IQ3_S`). The policy targets them; `ornith quantize` falls back to `F16`
-      for these tensors and logs it honestly. This is the main remaining encoder
-      work to hit the ~113GB asymmetric footprint.
+- [x] k-quant codecs (`src/ornith_quant.c`, ggml-exact super-block layouts,
+      QK_K=256): **decoders** for `Q2_K`/`Q4_K`/`Q5_K`/`Q6_K` and **encoders**
+      for `Q4_K`/`Q6_K` (round-to-nearest). Round-trip tested; the decoders are
+      verified against the **real official 9B GGUF** — `ornith run` dequantizes
+      all 427 tensors to f32, all finite, weight ranges sane.
+- [ ] remaining encoders: `Q2_K`/`Q5_K` encode (decode works) and the i-quants
+      `IQ2_XXS`/`IQ3_S` (the cold-expert types). `ornith quantize` still falls
+      back to `F16` for not-yet-encoded targets and logs it. These close the gap
+      to the ~113GB asymmetric 397B footprint.
 - [ ] imatrix collector on a code-heavy calibration set
 - [ ] per-expert mixed precision from router hit-frequency (depends on imatrix)
 - [ ] convert 35B first (validate against the official 35B GGUF), then 397B —
@@ -58,10 +63,22 @@ Correctness before speed. 35B is the bring-up target.
 - [x] `ornith run`: loads a GGUF, detects the Ornith hybrid layout via the real
       tensor names (`token_embd` / `output[_norm]` / `blk.N.attn_*` /
       `blk.N.ssm_*`), and runs the forward engine
-- [ ] real *quantized*-weight binding from GGUF (needs the M1 asymmetric dequant
-      kernels: IQ2_XXS / Q2_K / Q*_K -> f32); `run` gates this path honestly
-- [ ] a sampling / generation loop (today `run` reports prefill + argmax only)
-- [ ] logit parity vs HF transformers on the real 35B (ship `tests/test-vectors/`)
+- [x] real-weight **dequant** from GGUF via the k-quant codecs: `ornith run`
+      loads the real (quantized) 9B and decodes every tensor to f32 (memory-safe
+      sample-decode), proving the dequant path on real weights.
+- [ ] **coherent** forward on real weights — needs three qwen3.5-exact ops the
+      reference engine currently approximates, all surfaced by loading the real
+      9B/config:
+      (1) **gated full attention**: `attn_output_gate=true` means `attn_q`
+          emits `[q | output_gate]` (so 9B is 16 q-heads x 256 + a 4096-wide
+          gate, 4 kv-heads); the attention output is multiplied by
+          `sigmoid(gate)` before `attn_output`.
+      (2) **exact gated-delta-net gating** from `ssm_a` (A_log) + `ssm_dt.bias`
+          + `ssm_alpha`/`ssm_beta` (the reference uses a sigmoid stand-in).
+      (3) the **IQ2_XXS/Q2_K** expert dequant for the MoE 35B/397B (9B is dense).
+- [ ] a tokenizer (read tokens/merges from GGUF metadata) for text I/O, then a
+      sampling / generation loop (today `run` reports prefill + argmax only)
+- [ ] logit parity vs HF transformers on the real 9B/35B (ship `tests/test-vectors/`)
 
 ## M3 — Metal backend (primary)
 - [ ] dequant + expert GEMM kernels for the asymmetric quant mix

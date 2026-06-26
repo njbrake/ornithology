@@ -154,10 +154,49 @@ int main(void) {
         }
         CHECK(q4_maxerr <= amax / 8.0 + 1e-3, "Q4_0 error within one step");
 
-        CHECK(oq_quantize(OGGML_Q6_K, src, q8, 64) == ORNITH_ERR_UNSUPPORTED,
+        CHECK(oq_quantize(OGGML_IQ2_XXS, src, q8, 64) == ORNITH_ERR_UNSUPPORTED,
               "unimplemented type reported");
         CHECK(!oq_is_implemented(OGGML_IQ2_XXS), "IQ2_XXS not implemented");
         CHECK(oq_is_implemented(OGGML_Q8_0), "Q8_0 implemented");
+
+        /* k-quants: block geometry must match ggml exactly */
+        CHECK(oq_block_bytes(OGGML_Q2_K) == 84,  "Q2_K block = 84 bytes");
+        CHECK(oq_block_bytes(OGGML_Q4_K) == 144, "Q4_K block = 144 bytes");
+        CHECK(oq_block_bytes(OGGML_Q5_K) == 176, "Q5_K block = 176 bytes");
+        CHECK(oq_block_bytes(OGGML_Q6_K) == 210, "Q6_K block = 210 bytes");
+        CHECK(oq_block_elems(OGGML_Q4_K) == 256, "Q4_K block = 256 elems");
+        CHECK(oq_is_implemented(OGGML_Q4_K), "Q4_K encode implemented");
+        CHECK(oq_is_implemented(OGGML_Q6_K), "Q6_K encode implemented");
+        CHECK(oq_can_decode(OGGML_Q2_K), "Q2_K decodable");
+        CHECK(oq_can_decode(OGGML_Q5_K), "Q5_K decodable");
+        CHECK(!oq_is_implemented(OGGML_Q2_K), "Q2_K not yet encodable");
+
+        /* Q4_K / Q6_K round-trip over a 256-element super-block. Weight-like
+         * data (roughly symmetric around 0). Error bounded by the quant step. */
+        float ksrc[256], kdeq[256];
+        float kamax = 0.0f;
+        for (int i = 0; i < 256; i++) {
+            ksrc[i] = sinf((float)i * 0.11f) * 0.6f + cosf((float)i * 0.37f) * 0.2f;
+            if (fabsf(ksrc[i]) > kamax) kamax = fabsf(ksrc[i]);
+        }
+        uint8_t kbuf[210];
+        CHECK(oq_quantize(OGGML_Q6_K, ksrc, kbuf, 256) == ORNITH_OK, "Q6_K quantize");
+        CHECK(oq_dequantize(OGGML_Q6_K, kbuf, kdeq, 256) == ORNITH_OK, "Q6_K dequant");
+        double q6_maxerr = 0.0;
+        for (int i = 0; i < 256; i++) {
+            double e = fabs((double)kdeq[i] - ksrc[i]);
+            if (e > q6_maxerr) q6_maxerr = e;
+        }
+        CHECK(q6_maxerr < kamax / 30.0, "Q6_K round-trip error small");
+
+        CHECK(oq_quantize(OGGML_Q4_K, ksrc, kbuf, 256) == ORNITH_OK, "Q4_K quantize");
+        CHECK(oq_dequantize(OGGML_Q4_K, kbuf, kdeq, 256) == ORNITH_OK, "Q4_K dequant");
+        double q4k_maxerr = 0.0;
+        for (int i = 0; i < 256; i++) {
+            double e = fabs((double)kdeq[i] - ksrc[i]);
+            if (e > q4k_maxerr) q4k_maxerr = e;
+        }
+        CHECK(q4k_maxerr < kamax / 8.0, "Q4_K round-trip error within a 4-bit step");
     }
 
     printf("== policy ==\n");

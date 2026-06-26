@@ -34,8 +34,13 @@ size_t oq_block_bytes(uint32_t type);
  * is not a whole number of blocks for a blocked type. */
 size_t oq_row_bytes(uint32_t type, size_t n_elems);
 
-/* True if oq_quantize/oq_dequantize can handle `type`. */
+/* True if oq_quantize can ENCODE `type` (used by the quantizer to decide F16
+ * fallback). */
 bool oq_is_implemented(uint32_t type);
+
+/* True if oq_dequantize can DECODE `type` — a superset of oq_is_implemented
+ * that also includes read-only paths (Q2_K, Q5_K) needed to load real GGUFs. */
+bool oq_can_decode(uint32_t type);
 
 /* ---- codecs ------------------------------------------------------------ */
 

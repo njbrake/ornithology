@@ -84,10 +84,14 @@ float oq_bf16_to_f32(uint16_t b) {
 
 #define QK 32  /* block size shared by Q8_0 and Q4_0 */
 
+#define QK_K 256  /* super-block size shared by the k-quants */
+
 size_t oq_block_elems(uint32_t type) {
     switch (type) {
     case OGGML_F32: case OGGML_F16: case OGGML_BF16: return 1;
     case OGGML_Q8_0: case OGGML_Q4_0:                return QK;
+    case OGGML_Q2_K: case OGGML_Q4_K: case OGGML_Q5_K: case OGGML_Q6_K:
+        return QK_K;
     default: return 0;
     }
 }
@@ -98,6 +102,10 @@ size_t oq_block_bytes(uint32_t type) {
     case OGGML_F16:  case OGGML_BF16: return 2;
     case OGGML_Q8_0: return 2 + QK;        /* f16 d + 32 int8 = 34 */
     case OGGML_Q4_0: return 2 + QK / 2;    /* f16 d + 16 nibbles = 18 */
+    case OGGML_Q2_K: return 84;            /* scales[16] + qs[64] + d + dmin */
+    case OGGML_Q4_K: return 144;           /* d + dmin + scales[12] + qs[128] */
+    case OGGML_Q5_K: return 176;           /* + qh[32] vs Q4_K */
+    case OGGML_Q6_K: return 210;           /* ql[128] + qh[64] + sc[16] + d */
     default: return 0;
     }
 }
@@ -110,7 +118,28 @@ size_t oq_row_bytes(uint32_t type, size_t n_elems) {
 }
 
 bool oq_is_implemented(uint32_t type) {
-    return oq_block_elems(type) != 0;
+    /* Encode-capable types (oq_quantize). The quantizer uses this to decide
+     * when to fall back to F16. Q2_K/Q5_K decode (oq_dequantize) but are not yet
+     * encoded, so they are intentionally excluded here. */
+    switch (type) {
+    case OGGML_F32: case OGGML_F16: case OGGML_BF16:
+    case OGGML_Q8_0: case OGGML_Q4_0:
+    case OGGML_Q4_K: case OGGML_Q6_K:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* True if oq_dequantize can decode `type` (a superset of oq_is_implemented:
+ * also covers the read-only Q2_K / Q5_K paths used to load real GGUFs). */
+bool oq_can_decode(uint32_t type) {
+    switch (type) {
+    case OGGML_Q2_K: case OGGML_Q5_K:
+        return true;
+    default:
+        return oq_is_implemented(type);
+    }
 }
 
 /* ---- codecs ------------------------------------------------------------ */
@@ -186,6 +215,222 @@ static void dequantize_q4_0(const uint8_t *src, float *dst, size_t nblk) {
     }
 }
 
+/* ---- k-quant super-blocks (QK_K = 256), ggml-compatible byte layouts ----
+ * The decoders mirror ggml's dequantize_row_* exactly so real GGUFs load
+ * correctly. The Q4_K/Q6_K encoders are round-to-nearest: they emit valid,
+ * interoperable blocks (quality a touch below ggml's iterative search, which is
+ * an M3 refinement). Q2_K/Q5_K are decode-only for now (enough to run the
+ * published quants). */
+
+/* Unpack the 6-bit scale `d` and 6-bit min `m` for sub-block j (0..7) from a
+ * Q4_K/Q5_K scales[12] field. */
+static void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) { *d = q[j] & 63; *m = q[j + 4] & 63; }
+    else {
+        *d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >>   4) | ((q[j    ] >> 6) << 4);
+    }
+}
+
+/* Inverse of get_scale_min_k4: pack 8 sub-block 6-bit scales/mins -> scales[12]. */
+static void put_scale_min_k4(uint8_t *q, const uint8_t *sc, const uint8_t *mn) {
+    for (int i = 0; i < 12; i++) q[i] = 0;
+    for (int j = 0; j < 4; j++) { q[j] = sc[j] & 63; q[j + 4] = mn[j] & 63; }
+    for (int j = 4; j < 8; j++) {
+        q[j + 4] = (uint8_t)((sc[j] & 0x0F) | ((mn[j] & 0x0F) << 4));
+        q[j - 4] |= (uint8_t)(((sc[j] >> 4) & 3) << 6);
+        q[j    ] |= (uint8_t)(((mn[j] >> 4) & 3) << 6);
+    }
+}
+
+static void dequantize_q2_K(const uint8_t *src, float *dst, size_t nblk) {
+    for (size_t b = 0; b < nblk; b++) {
+        const uint8_t *p = src + b * 84;
+        const uint8_t *scales = p;        /* 16 */
+        const uint8_t *q = p + 16;        /* 64 */
+        float d    = oq_f16_to_f32(le_get_u16(p + 80));
+        float dmin = oq_f16_to_f32(le_get_u16(p + 82));
+        float *y = dst + b * QK_K;
+        int is = 0;
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                uint8_t sc = scales[is++];
+                float dl = d * (sc & 0xF), ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; l++) *y++ = dl * ((q[l] >> shift) & 3) - ml;
+                sc = scales[is++];
+                dl = d * (sc & 0xF); ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; l++) *y++ = dl * ((q[l+16] >> shift) & 3) - ml;
+                shift += 2;
+            }
+            q += 32;
+        }
+    }
+}
+
+static void dequantize_q4_K(const uint8_t *src, float *dst, size_t nblk) {
+    for (size_t b = 0; b < nblk; b++) {
+        const uint8_t *p = src + b * 144;
+        float d    = oq_f16_to_f32(le_get_u16(p));
+        float dmin = oq_f16_to_f32(le_get_u16(p + 2));
+        const uint8_t *scales = p + 4;    /* 12 */
+        const uint8_t *q = p + 16;        /* 128 */
+        float *y = dst + b * QK_K;
+        int is = 0;
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, scales, &sc, &m); float d1 = d*sc, m1 = dmin*m;
+            get_scale_min_k4(is + 1, scales, &sc, &m); float d2 = d*sc, m2 = dmin*m;
+            for (int l = 0; l < 32; l++) *y++ = d1 * (q[l] & 0xF) - m1;
+            for (int l = 0; l < 32; l++) *y++ = d2 * (q[l] >>  4) - m2;
+            q += 32; is += 2;
+        }
+    }
+}
+
+static void dequantize_q5_K(const uint8_t *src, float *dst, size_t nblk) {
+    for (size_t b = 0; b < nblk; b++) {
+        const uint8_t *p = src + b * 176;
+        float d    = oq_f16_to_f32(le_get_u16(p));
+        float dmin = oq_f16_to_f32(le_get_u16(p + 2));
+        const uint8_t *scales = p + 4;    /* 12 */
+        const uint8_t *qh = p + 16;       /* 32 */
+        const uint8_t *ql = p + 48;       /* 128 */
+        float *y = dst + b * QK_K;
+        int is = 0; uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, scales, &sc, &m); float d1 = d*sc, m1 = dmin*m;
+            get_scale_min_k4(is + 1, scales, &sc, &m); float d2 = d*sc, m2 = dmin*m;
+            for (int l = 0; l < 32; l++)
+                *y++ = d1 * ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; l++)
+                *y++ = d2 * ((ql[l] >>  4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+            ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+        }
+    }
+}
+
+static void dequantize_q6_K(const uint8_t *src, float *dst, size_t nblk) {
+    for (size_t b = 0; b < nblk; b++) {
+        const uint8_t *p = src + b * 210;
+        const uint8_t *ql = p;            /* 128 */
+        const uint8_t *qh = p + 128;      /* 64 */
+        const int8_t  *sc = (const int8_t *)(p + 192); /* 16 */
+        float d = oq_f16_to_f32(le_get_u16(p + 208));
+        float *y = dst + b * QK_K;
+        for (int n = 0; n < QK_K; n += 128) {
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                int q1 = (int)((ql[l+ 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int q2 = (int)((ql[l+32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((ql[l+ 0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((ql[l+32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l+ 0] = d * sc[is + 0] * q1;
+                y[l+32] = d * sc[is + 2] * q2;
+                y[l+64] = d * sc[is + 4] * q3;
+                y[l+96] = d * sc[is + 6] * q4;
+            }
+            y += 128; ql += 64; qh += 32; sc += 8;
+        }
+    }
+}
+
+/* Q6_K encode (RTN): 16 groups of 16 share an int8 scale; superblock d scales
+ * those. value = d * sc[group] * (q - 32), q in [0,63]. */
+static void quantize_q6_K(const float *src, uint8_t *dst, size_t nblk) {
+    for (size_t b = 0; b < nblk; b++) {
+        const float *x = src + b * QK_K;
+        uint8_t *p = dst + b * 210;
+        uint8_t *ql = p, *qh = p + 128;
+        int8_t  *sc = (int8_t *)(p + 192);
+        float gscale[16], maxs = 0.0f;
+        for (int g = 0; g < 16; g++) {
+            float amax = 0.0f;
+            for (int l = 0; l < 16; l++) { float a = fabsf(x[g*16+l]); if (a > amax) amax = a; }
+            gscale[g] = amax / 32.0f;
+            if (gscale[g] > maxs) maxs = gscale[g];
+        }
+        float d = maxs / 127.0f, id = d ? 1.0f / d : 0.0f;
+        le_put_u16(p + 208, oq_f32_to_f16(d));
+        for (int g = 0; g < 16; g++) {
+            int s = (int)lroundf(gscale[g] * id);
+            s = s < 0 ? 0 : (s > 127 ? 127 : s);
+            sc[g] = (int8_t)s;
+        }
+        uint8_t Q[256];
+        for (int g = 0; g < 16; g++) {
+            float gs = d * sc[g], igs = gs ? 1.0f / gs : 0.0f;
+            for (int l = 0; l < 16; l++) {
+                int q = (int)lroundf(x[g*16+l] * igs) + 32;
+                q = q < 0 ? 0 : (q > 63 ? 63 : q);
+                Q[g*16+l] = (uint8_t)q;
+            }
+        }
+        memset(ql, 0, 128); memset(qh, 0, 64);
+        for (int n = 0; n < QK_K; n += 128) {
+            uint8_t *qlp = ql + (n/128)*64, *qhp = qh + (n/128)*32;
+            const uint8_t *Qn = Q + n;
+            for (int l = 0; l < 32; l++) {
+                uint8_t q1 = Qn[l+0], q2 = Qn[l+32], q3 = Qn[l+64], q4 = Qn[l+96];
+                qlp[l+ 0] = (uint8_t)((q1 & 0xF) | ((q3 & 0xF) << 4));
+                qlp[l+32] = (uint8_t)((q2 & 0xF) | ((q4 & 0xF) << 4));
+                qhp[l] = (uint8_t)(((q1>>4)&3) | (((q2>>4)&3)<<2) |
+                                   (((q3>>4)&3)<<4) | (((q4>>4)&3)<<6));
+            }
+        }
+    }
+}
+
+/* Q4_K encode (RTN): 8 sub-blocks of 32, each an affine (scale, min);
+ * value = d*scale*q - dmin*min, q in [0,15]. */
+static void quantize_q4_K(const float *src, uint8_t *dst, size_t nblk) {
+    for (size_t b = 0; b < nblk; b++) {
+        const float *x = src + b * QK_K;
+        uint8_t *p = dst + b * 144;
+        float subscale[8], submin[8];
+        for (int j = 0; j < 8; j++) {
+            const float *xs = x + j*32;
+            float lo = xs[0], hi = xs[0];
+            for (int l = 1; l < 32; l++) { if (xs[l] < lo) lo = xs[l]; if (xs[l] > hi) hi = xs[l]; }
+            if (lo > 0.0f) lo = 0.0f;          /* min term is subtracted, m>=0 */
+            subscale[j] = (hi - lo) / 15.0f;
+            submin[j]   = -lo;
+        }
+        float maxsc = 0.0f, maxmn = 0.0f;
+        for (int j = 0; j < 8; j++) {
+            if (subscale[j] > maxsc) maxsc = subscale[j];
+            if (submin[j]   > maxmn) maxmn = submin[j];
+        }
+        float d = maxsc / 63.0f, dmin = maxmn / 63.0f;
+        float id = d ? 1.0f/d : 0.0f, idm = dmin ? 1.0f/dmin : 0.0f;
+        uint8_t sc6[8], mn6[8];
+        for (int j = 0; j < 8; j++) {
+            int s = (int)lroundf(subscale[j]*id);
+            int m = (int)lroundf(submin[j]*idm);
+            s = s < 0 ? 0 : (s > 63 ? 63 : s);
+            m = m < 0 ? 0 : (m > 63 ? 63 : m);
+            sc6[j] = (uint8_t)s; mn6[j] = (uint8_t)m;
+        }
+        le_put_u16(p,     oq_f32_to_f16(d));
+        le_put_u16(p + 2, oq_f32_to_f16(dmin));
+        put_scale_min_k4(p + 4, sc6, mn6);
+        uint8_t *q = p + 16;
+        memset(q, 0, 128);
+        for (int j = 0; j < 8; j++) {
+            float rs = d * sc6[j], rm = dmin * mn6[j], irs = rs ? 1.0f/rs : 0.0f;
+            const float *xs = x + j*32;
+            int g = j / 2; bool low = (j % 2) == 0;
+            for (int l = 0; l < 32; l++) {
+                int v = (int)lroundf((xs[l] + rm) * irs);
+                v = v < 0 ? 0 : (v > 15 ? 15 : v);
+                if (low) q[g*32 + l] |= (uint8_t)v;
+                else     q[g*32 + l] |= (uint8_t)(v << 4);
+            }
+        }
+    }
+}
+
 ornith_status oq_quantize(uint32_t type, const float *src, void *dst,
                           size_t n_elems) {
     switch (type) {
@@ -213,6 +458,16 @@ ornith_status oq_quantize(uint32_t type, const float *src, void *dst,
         if (n_elems % QK) { ornith_set_error("Q4_0 needs multiple of %d", QK);
                             return ORNITH_ERR_FORMAT; }
         quantize_q4_0(src, dst, n_elems / QK);
+        return ORNITH_OK;
+    case OGGML_Q4_K:
+        if (n_elems % QK_K) { ornith_set_error("Q4_K needs multiple of %d", QK_K);
+                              return ORNITH_ERR_FORMAT; }
+        quantize_q4_K(src, dst, n_elems / QK_K);
+        return ORNITH_OK;
+    case OGGML_Q6_K:
+        if (n_elems % QK_K) { ornith_set_error("Q6_K needs multiple of %d", QK_K);
+                              return ORNITH_ERR_FORMAT; }
+        quantize_q6_K(src, dst, n_elems / QK_K);
         return ORNITH_OK;
     default:
         ornith_set_error("oq_quantize: type %s not implemented",
@@ -245,6 +500,15 @@ ornith_status oq_dequantize(uint32_t type, const void *src, float *dst,
         if (n_elems % QK) { ornith_set_error("Q4_0 needs multiple of %d", QK);
                             return ORNITH_ERR_FORMAT; }
         dequantize_q4_0(s, dst, n_elems / QK);
+        return ORNITH_OK;
+    case OGGML_Q2_K: case OGGML_Q4_K: case OGGML_Q5_K: case OGGML_Q6_K:
+        if (n_elems % QK_K) { ornith_set_error("%s needs multiple of %d",
+                              oggml_type_name(type), QK_K);
+                              return ORNITH_ERR_FORMAT; }
+        if      (type == OGGML_Q2_K) dequantize_q2_K(s, dst, n_elems / QK_K);
+        else if (type == OGGML_Q4_K) dequantize_q4_K(s, dst, n_elems / QK_K);
+        else if (type == OGGML_Q5_K) dequantize_q5_K(s, dst, n_elems / QK_K);
+        else                         dequantize_q6_K(s, dst, n_elems / QK_K);
         return ORNITH_OK;
     default:
         ornith_set_error("oq_dequantize: type %s not implemented",
