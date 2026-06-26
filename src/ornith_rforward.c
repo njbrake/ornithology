@@ -434,13 +434,11 @@ ornith_status rmodel_generate(rmodel *m, const char *prompt, int n_predict,
         rforward_token(m, s, ptoks[i], (i == np - 1) ? logits : NULL);
 
     char piece[256];
-    int produced = 0;
     int32_t next = argmax_f(logits, V);
     for (int step = 0; step < n_predict; step++) {
         if (next == a->eos_token_id) break;
         size_t pl = otok_detok_token(&m->tok, next, piece, sizeof(piece));
         fwrite(piece, 1, pl, out); fflush(out);
-        produced++;
         rforward_token(m, s, next, logits);
         next = argmax_f(logits, V);
     }

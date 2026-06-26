@@ -13,8 +13,15 @@
 
 CC      ?= cc
 CSTD    ?= -std=c11
-CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter $(CSTD)
+CFLAGS  ?= -O3 -Wall -Wextra -Wno-unused-parameter $(CSTD)
 CFLAGS  += -pthread
+# Target the host CPU (NEON/AVX) — speeds up the scalar dequant + matvec loops.
+ARCH := $(shell uname -m)
+ifneq (,$(filter $(ARCH),arm64 aarch64))
+  CFLAGS += -mcpu=native
+else
+  CFLAGS += -march=native
+endif
 LDFLAGS ?=
 LIBS    ?= -lm -pthread
 
