@@ -4,6 +4,7 @@
 #include "ornith_quant.h"
 #include "ornith_qdot.h"
 #include "ornith_tensor.h"
+#include "ornith_sample.h"
 #include "ornith_attn.h"
 #include "ornith_moe.h"
 #include <stdlib.h>
@@ -833,17 +834,36 @@ static void rprefill(rmodel *m, rstate *s, const int32_t *toks, int np,
     }
 }
 
-ornith_status rmodel_generate(rmodel *m, const char *prompt, int n_predict,
-                              FILE *out) {
+/* Pick the next token: greedy argmax when sp is NULL or greedy, else sample.
+ * `hist`/`nhist` is the recent-token history for the repeat penalty. */
+static int32_t rpick(const float *logits, int V, const osample_params *sp,
+                     ot_rng *rng, const int32_t *hist, int nhist,
+                     float *scratch) {
+    if (!sp) return argmax_f(logits, V);
+    /* osample mutates logits (penalty/temperature); work on a copy so the
+     * caller's buffer is reusable and greedy paths stay pure. */
+    memcpy(scratch, logits, (size_t)V * sizeof(float));
+    return osample(scratch, V, sp, rng, hist, nhist);
+}
+
+ornith_status rmodel_generate_s(rmodel *m, const char *prompt, int n_predict,
+                                const osample_params *sp, FILE *out) {
     const ornith_arch *a = &m->a;
     int V = a->vocab_size;
     int32_t *ptoks = NULL; int np = 0;
     otok_encode(&m->tok, prompt, &ptoks, &np);
     if (np == 0) { free(ptoks); ornith_set_error("empty prompt"); return ORNITH_ERR_FORMAT; }
+    if (n_predict < 0) n_predict = 0;
 
     int cap = np + n_predict + 4;
     rstate *s = rstate_new(a, cap);
     float *logits = malloc((size_t)V*sizeof(float));
+    float *scratch = sp ? malloc((size_t)V*sizeof(float)) : NULL;
+    /* recent-token history (prompt + generated) for the repeat penalty */
+    int32_t *hist = malloc((size_t)cap*sizeof(int32_t));
+    int nhist = 0;
+    for (int i = 0; i < np; i++) hist[nhist++] = ptoks[i];
+    ot_rng rng = ot_rng_seed(sp ? sp->seed : 0);
 
     fprintf(out, "%s", prompt);
     fflush(out);
@@ -852,27 +872,34 @@ ornith_status rmodel_generate(rmodel *m, const char *prompt, int n_predict,
     rprefill(m, s, ptoks, np, logits);
 
     char piece[256];
-    int32_t next = argmax_f(logits, V);
+    int32_t next = rpick(logits, V, sp, &rng, hist, nhist, scratch);
     for (int step = 0; step < n_predict; step++) {
         if (next == a->eos_token_id) break;
         size_t pl = otok_detok_token(&m->tok, next, piece, sizeof(piece));
         fwrite(piece, 1, pl, out); fflush(out);
+        if (nhist < cap) hist[nhist++] = next;
         rforward_token(m, s, next, logits);
-        next = argmax_f(logits, V);
+        next = rpick(logits, V, sp, &rng, hist, nhist, scratch);
     }
     fprintf(out, "\n");
 
-    free(ptoks); free(logits); rstate_free(s);
+    free(ptoks); free(logits); free(scratch); free(hist); rstate_free(s);
     return ORNITH_OK;
 }
 
-ornith_status rmodel_generate_ids(rmodel *m,
-                                  const int32_t *prompt_ids, int n_prompt,
-                                  int n_predict,
-                                  const int32_t *stop_ids, int n_stop,
-                                  void (*on_token)(int32_t id, const char *piece,
-                                                   void *ud),
-                                  void *ud, int *out_finish) {
+ornith_status rmodel_generate(rmodel *m, const char *prompt, int n_predict,
+                              FILE *out) {
+    return rmodel_generate_s(m, prompt, n_predict, NULL, out);
+}
+
+ornith_status rmodel_generate_ids_s(rmodel *m,
+                                    const int32_t *prompt_ids, int n_prompt,
+                                    int n_predict,
+                                    const int32_t *stop_ids, int n_stop,
+                                    const osample_params *sp,
+                                    void (*on_token)(int32_t id,
+                                                     const char *piece, void *ud),
+                                    void *ud, int *out_finish) {
     const ornith_arch *a = &m->a;
     int V = a->vocab_size;
     if (n_prompt <= 0) { ornith_set_error("empty prompt"); return ORNITH_ERR_FORMAT; }
@@ -883,13 +910,22 @@ ornith_status rmodel_generate_ids(rmodel *m,
     if (!s) { ornith_set_error("oom"); return ORNITH_ERR_OOM; }
     float *logits = malloc((size_t)V * sizeof(float));
     if (!logits) { rstate_free(s); ornith_set_error("oom"); return ORNITH_ERR_OOM; }
+    float *scratch = sp ? malloc((size_t)V * sizeof(float)) : NULL;
+    int32_t *hist = malloc((size_t)cap * sizeof(int32_t));
+    if ((sp && !scratch) || !hist) {
+        free(logits); free(scratch); free(hist); rstate_free(s);
+        ornith_set_error("oom"); return ORNITH_ERR_OOM;
+    }
+    int nhist = 0;
+    for (int i = 0; i < n_prompt; i++) hist[nhist++] = prompt_ids[i];
+    ot_rng rng = ot_rng_seed(sp ? sp->seed : 0);
 
     /* prefill: chunked parallel-scan for linear layers (last pos -> logits) */
     rprefill(m, s, prompt_ids, n_prompt, logits);
 
     int finish = 1;  /* default: hit the length cap */
     char piece[512];
-    int32_t next = argmax_f(logits, V);
+    int32_t next = rpick(logits, V, sp, &rng, hist, nhist, scratch);
     for (int step = 0; step < n_predict; step++) {
         int stop = (next == a->eos_token_id);
         for (int k = 0; !stop && k < n_stop; k++)
@@ -899,11 +935,24 @@ ornith_status rmodel_generate_ids(rmodel *m,
         otok_detok_token(&m->tok, next, piece, sizeof(piece));
         if (on_token) on_token(next, piece, ud);
 
+        if (nhist < cap) hist[nhist++] = next;
         rforward_token(m, s, next, logits);
-        next = argmax_f(logits, V);
+        next = rpick(logits, V, sp, &rng, hist, nhist, scratch);
     }
 
     if (out_finish) *out_finish = finish;
-    free(logits); rstate_free(s);
+    free(logits); free(scratch); free(hist); rstate_free(s);
     return ORNITH_OK;
+}
+
+ornith_status rmodel_generate_ids(rmodel *m,
+                                  const int32_t *prompt_ids, int n_prompt,
+                                  int n_predict,
+                                  const int32_t *stop_ids, int n_stop,
+                                  void (*on_token)(int32_t id, const char *piece,
+                                                   void *ud),
+                                  void *ud, int *out_finish) {
+    return rmodel_generate_ids_s(m, prompt_ids, n_prompt, n_predict,
+                                 stop_ids, n_stop, NULL,
+                                 on_token, ud, out_finish);
 }

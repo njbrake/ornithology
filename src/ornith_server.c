@@ -169,11 +169,28 @@ static char *collapse_content(const ojson *v) {
 /* protocol parsers: each fills the unified history + options               */
 /* ======================================================================== */
 
+/* Parse the sampler knobs common to all three protocols into o->samp. Absent
+ * fields keep the greedy default (temperature 0), so behaviour stays
+ * deterministic unless the client explicitly asks for sampling. The field names
+ * line up across OpenAI/Anthropic (temperature, top_p, top_k); seed/min_p/
+ * repeat_penalty are accepted as extensions wherever a client sends them. */
+static void srv_parse_sampling(const ojson *root, gen_opts *o) {
+    osample_params s = osample_params_default();
+    s.temperature    = (float)ojson_get_num(root, "temperature",    s.temperature);
+    s.top_p          = (float)ojson_get_num(root, "top_p",          s.top_p);
+    s.top_k          = (int)  ojson_get_int(root, "top_k",          s.top_k);
+    s.min_p          = (float)ojson_get_num(root, "min_p",          s.min_p);
+    s.repeat_penalty = (float)ojson_get_num(root, "repeat_penalty", s.repeat_penalty);
+    s.seed           = (uint64_t)ojson_get_int(root, "seed",        (long)s.seed);
+    o->samp = s;
+}
+
 const char *srv_parse_openai_chat(const ojson *root, chat_msgs *out, gen_opts *o) {
     chat_msgs_init(out);
     o->max_tokens = (int)ojson_get_int(root, "max_tokens", 256);
     if (o->max_tokens <= 0) o->max_tokens = 256;
     o->stream = ojson_get_bool(root, "stream", false);
+    srv_parse_sampling(root, o);
     const ojson *msgs = ojson_get(root, "messages");
     if (!msgs || msgs->type != OJSON_ARRAY || msgs->count == 0)
         return "missing or empty 'messages' array";
@@ -193,6 +210,7 @@ const char *srv_parse_responses(const ojson *root, chat_msgs *out, gen_opts *o) 
     o->max_tokens = (int)ojson_get_int(root, "max_output_tokens", 256);
     if (o->max_tokens <= 0) o->max_tokens = 256;
     o->stream = ojson_get_bool(root, "stream", false);
+    srv_parse_sampling(root, o);
     const char *instr = ojson_get_str(root, "instructions", NULL);
     if (instr) chat_msgs_add(out, "system", instr);
     const ojson *input = ojson_get(root, "input");
@@ -227,6 +245,7 @@ const char *srv_parse_anthropic(const ojson *root, chat_msgs *out, gen_opts *o) 
     o->max_tokens = (int)ojson_get_int(root, "max_tokens", 256);
     if (o->max_tokens <= 0) o->max_tokens = 256;
     o->stream = ojson_get_bool(root, "stream", false);
+    srv_parse_sampling(root, o);
     const ojson *sys = ojson_get(root, "system");
     if (sys) { char *t = collapse_content(sys); if (t[0]) chat_msgs_add(out, "system", t); free(t); }
     const ojson *msgs = ojson_get(root, "messages");
@@ -446,15 +465,16 @@ static void on_token_stream(int32_t id, const char *piece, void *ud) {
 
 /* Run greedy generation under the global lock, collecting text + count. */
 static int generate_collect(const int32_t *pids, int n_prompt, int max_tokens,
+                            const osample_params *sp,
                             sbuf *out_text, int *out_count, int *out_finish) {
     int32_t stop_ids[1]; int n_stop = 0;
     if (g_im_end >= 0) stop_ids[n_stop++] = g_im_end;
     collect_ctx cc; sbuf_init(&cc.text); cc.count = 0;
     int finish = 1;
     pthread_mutex_lock(&g_gen_lock);
-    ornith_status st = rmodel_generate_ids(g_model, pids, n_prompt, max_tokens,
-                                           stop_ids, n_stop, on_token_collect,
-                                           &cc, &finish);
+    ornith_status st = rmodel_generate_ids_s(g_model, pids, n_prompt, max_tokens,
+                                             stop_ids, n_stop, sp, on_token_collect,
+                                             &cc, &finish);
     pthread_mutex_unlock(&g_gen_lock);
     if (st != ORNITH_OK) { sbuf_free(&cc.text); return -1; }
     *out_text = cc.text; *out_count = cc.count; *out_finish = finish;
@@ -466,7 +486,9 @@ static int generate_collect(const int32_t *pids, int n_prompt, int max_tokens,
 /* ======================================================================== */
 
 static void run_request(int fd, api_style api, const ojson *root) {
-    chat_msgs hist; gen_opts opt = {256, false};
+    chat_msgs hist;
+    gen_opts opt = { .max_tokens = 256, .stream = false,
+                     .samp = {0} };
     const char *perr = NULL;
     if (api == API_CHAT)            perr = srv_parse_openai_chat(root, &hist, &opt);
     else if (api == API_RESPONSES)  perr = srv_parse_responses(root, &hist, &opt);
@@ -527,8 +549,8 @@ static void run_request(int fd, api_style api, const ojson *root) {
         if (g_im_end >= 0) stop_ids[n_stop++] = g_im_end;
         int finish = 1;
         pthread_mutex_lock(&g_gen_lock);
-        rmodel_generate_ids(g_model, pids, n_prompt, opt.max_tokens, stop_ids, n_stop,
-                            on_token_stream, &sc, &finish);
+        rmodel_generate_ids_s(g_model, pids, n_prompt, opt.max_tokens, stop_ids,
+                              n_stop, &opt.samp, on_token_stream, &sc, &finish);
         pthread_mutex_unlock(&g_gen_lock);
         free(pids);
 
@@ -563,7 +585,7 @@ static void run_request(int fd, api_style api, const ojson *root) {
 
     /* non-streaming */
     sbuf text; int count = 0, finish = 1;
-    if (generate_collect(pids, n_prompt, opt.max_tokens, &text, &count, &finish) != 0) {
+    if (generate_collect(pids, n_prompt, opt.max_tokens, &opt.samp, &text, &count, &finish) != 0) {
         free(pids);
         send_error(fd, 500, "Internal Server Error", "server_error", "generation failed");
         return;
