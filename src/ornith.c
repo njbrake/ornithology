@@ -22,6 +22,7 @@
 #include "ornith_quant.h"
 #include "ornith_forward.h"
 #include "ornith_rforward.h"
+#include "ornith_server.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -317,10 +318,12 @@ static void usage(const char *argv0) {
         "  %s run [--prompt TEXT] [-n N] <model.gguf>\n"
         "        with --prompt: real-weight greedy generation (default N=32);\n"
         "        without: inspect + dequant check + synthetic self-test\n"
+        "  %s serve [--host H] [--port P] <model.gguf>\n"
+        "        OpenAI/Anthropic-compatible HTTP server (default 127.0.0.1:8080)\n"
         "\n"
         "quantize applies the asymmetric POLICY.md mapping; --base TYPE\n"
         "(f32|f16|bf16|q8_0|q4_0, default f16) covers tensors with no rule.\n",
-        ORNITH_VERSION, argv0, argv0, argv0, argv0, argv0, argv0);
+        ORNITH_VERSION, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -373,6 +376,9 @@ int main(int argc, char **argv) {
         if (!path) { usage(argv[0]); return 1; }
         if (prompt) return cmd_generate(path, prompt, n_predict);
         return cmd_run(path);   /* no prompt: inspect + synthetic self-test */
+    }
+    if (!strcmp(cmd, "serve")) {
+        return ornith_server_main(argc - 2, argv + 2);
     }
 
     usage(argv[0]);

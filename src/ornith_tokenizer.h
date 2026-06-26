@@ -47,6 +47,12 @@ void otok_free(otokenizer *t);
 ornith_status otok_encode(const otokenizer *t, const char *text,
                           int32_t **ids, int *n);
 
+/* Look up the id of an exact vocab piece (e.g. a special token like
+ * "<|im_start|>"). Returns the id, or -1 if the piece is not in the vocab.
+ * This does NOT run BPE; it is an exact piece->id match, which is what special
+ * tokens need (they are single atomic vocab entries). */
+int32_t otok_id_of(const otokenizer *t, const char *piece);
+
 /* Append the raw bytes of one token id to buf (NUL-terminated, bounded by cap).
  * Returns the number of bytes appended. */
 size_t otok_detok_token(const otokenizer *t, int32_t id, char *buf, size_t cap);

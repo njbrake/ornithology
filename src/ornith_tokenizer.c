@@ -362,6 +362,12 @@ static size_t next_chunk(const char *s, size_t n, size_t i) {
     return i + 1;
 }
 
+int32_t otok_id_of(const otokenizer *t, const char *piece) {
+    int id;
+    if (smap_get(&t->vocab, piece, &id)) return (int32_t)id;
+    return -1;
+}
+
 ornith_status otok_encode(const otokenizer *t, const char *text,
                           int32_t **ids_out, int *n_out) {
     size_t n = strlen(text);
