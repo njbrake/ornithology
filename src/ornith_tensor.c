@@ -116,6 +116,7 @@ void ot_softmax(float *x, int n) {
 
 float ot_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 float ot_silu1(float x)  { return x * ot_sigmoid(x); }
+float ot_softplus(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
 
 void ot_silu_(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] = ot_silu1(x[i]);
@@ -151,20 +152,31 @@ void ot_l2normalize(const float *x, float *out, int n, float eps) {
     float inv = 1.0f / (ot_l2norm(x, n) + eps);
     for (int i = 0; i < n; i++) out[i] = x[i] * inv;
 }
+void ot_l2norm_eps(const float *x, float *out, int n, float eps) {
+    double ss = 0.0;
+    for (int i = 0; i < n; i++) ss += (double)x[i] * x[i];
+    float inv = (float)(1.0 / sqrt(ss + (double)eps));
+    for (int i = 0; i < n; i++) out[i] = x[i] * inv;
+}
 
 /* ---- RoPE -------------------------------------------------------------- */
 /* NeoX / HF "rotate-half" layout: the head vector is split into two halves and
  * dimension i is paired with dimension i + head_dim/2. Frequency for pair i is
  * theta^(-2i/head_dim); the rotation angle at position p is p * freq. */
 
-void ot_rope_inplace(float *v, int head_dim, int pos, float theta) {
-    int half = head_dim / 2;
+void ot_rope_partial(float *v, int head_dim, int rotary_dim, int pos, float theta) {
+    if (rotary_dim <= 0 || rotary_dim > head_dim) rotary_dim = head_dim;
+    int half = rotary_dim / 2;
     for (int i = 0; i < half; i++) {
-        float freq = powf(theta, -2.0f * (float)i / (float)head_dim);
+        float freq = powf(theta, -2.0f * (float)i / (float)rotary_dim);
         float ang  = (float)pos * freq;
         float c = cosf(ang), s = sinf(ang);
         float a = v[i], b = v[i + half];
         v[i]        = a * c - b * s;
         v[i + half] = a * s + b * c;
     }
+}
+
+void ot_rope_inplace(float *v, int head_dim, int pos, float theta) {
+    ot_rope_partial(v, head_dim, head_dim, pos, theta);
 }

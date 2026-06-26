@@ -28,10 +28,12 @@ typedef struct {
     float *q_norm, *k_norm;     /* QK-norm, [head_dim] each */
     /* linear attention (gated delta-net) */
     float *lq, *lk, *lv;        /* projections (the fused attn_qkv, split out) */
-    float *la, *lb;             /* decay / write-rate gates, [n_v_heads, H] */
+    float *la, *lb;             /* a (ssm_alpha) / beta (ssm_beta) projs [nv,H]*/
+    float *ssm_a;               /* A_log per value head [nv]                   */
+    float *ssm_dt;              /* dt bias per value head [nv]                 */
     float *conv_w, *conv_b;     /* depthwise conv [Cc, K], bias [Cc] */
     float *lgate;               /* output gate proj [n_v*dv, H] */
-    float *lnorm;               /* per-head out RMSNorm weight [dv] */
+    float *lnorm;               /* per-head out RMSNorm weight [dv] (ssm_norm) */
     float *lo;                  /* out proj [H, n_v*dv] */
     /* MoE FFN */
     float *ffn_norm;            /* [H] */
@@ -54,6 +56,10 @@ static int lin_vdim(const ornith_arch *a){ return a->lin_value_heads*a->lin_valu
 static int lin_cc(const ornith_arch *a){ return 2*lin_qdim(a) + lin_vdim(a); }
 static int full_qdim(const ornith_arch *a){ return a->num_attn_heads*a->head_dim; }
 static int full_kvdim(const ornith_arch *a){ return a->num_kv_heads*a->head_dim; }
+/* attn_q output width: when output-gated, packs [query|gate] per head. */
+static int full_qproj(const ornith_arch *a){
+    return (a->attn_output_gate ? 2 : 1) * full_qdim(a);
+}
 
 /* ---- synthetic model construction ------------------------------------- */
 
@@ -77,6 +83,8 @@ void ornith_arch_tiny(ornith_arch *a) {
     a->num_attn_heads = 4;
     a->num_kv_heads = 2;
     a->head_dim = 8;
+    a->rope_dim = 4;              /* partial rope (exercise the partial path)   */
+    a->attn_output_gate = true;  /* exercise the full-attn output gate          */
     a->full_attn_interval = 4;
     a->lin_key_heads = 2;
     a->lin_value_heads = 4;
@@ -114,7 +122,7 @@ of_model *of_model_build_synthetic(const ornith_arch *a, uint64_t seed) {
         ly->is_full = ornith_layer_is_full_attn(a, L);
         ly->attn_norm = rng_alloc(&r, H, 0.7f, 1.3f);
         if (ly->is_full) {
-            ly->wq = rng_alloc(&r, (int64_t)full_qdim(a) * H, -W, W);
+            ly->wq = rng_alloc(&r, (int64_t)full_qproj(a) * H, -W, W);
             ly->wk = rng_alloc(&r, (int64_t)full_kvdim(a) * H, -W, W);
             ly->wv = rng_alloc(&r, (int64_t)full_kvdim(a) * H, -W, W);
             ly->wo = rng_alloc(&r, (int64_t)H * full_qdim(a), -W, W);
@@ -126,6 +134,8 @@ of_model *of_model_build_synthetic(const ornith_arch *a, uint64_t seed) {
             ly->lv = rng_alloc(&r, (int64_t)lin_vdim(a) * H, -W, W);
             ly->la = rng_alloc(&r, (int64_t)nv * H, -W, W);
             ly->lb = rng_alloc(&r, (int64_t)nv * H, -W, W);
+            ly->ssm_a = rng_alloc(&r, nv, -W, W);
+            ly->ssm_dt = rng_alloc(&r, nv, -W, W);
             ly->conv_w = rng_alloc(&r, (int64_t)lin_cc(a) * a->lin_conv_kernel, -W, W);
             ly->conv_b = rng_alloc(&r, lin_cc(a), -W, W);
             ly->lgate = rng_alloc(&r, (int64_t)lin_vdim(a) * H, -W, W);
@@ -157,6 +167,7 @@ void of_model_free(of_model *m) {
             free(ly->q_norm); free(ly->k_norm);
             free(ly->lq); free(ly->lk); free(ly->lv);
             free(ly->la); free(ly->lb);
+            free(ly->ssm_a); free(ly->ssm_dt);
             free(ly->conv_w); free(ly->conv_b);
             free(ly->lgate); free(ly->lnorm); free(ly->lo);
             free(ly->ffn_norm); free(ly->router);
@@ -261,14 +272,44 @@ static void moe_residual(const of_model *m, const of_layer *ly,
     free(out); free(scr); free(xn);
 }
 
-/* Apply QK-norm (per-head RMSNorm with weight) then RoPE to a full-attn q/k. */
-static void qk_norm_rope(float *vec, int n_heads, int hd, const float *norm_w,
-                         int pos, float theta, float eps) {
+/* Apply QK-norm (per-head RMSNorm with weight) then (partial) RoPE to a
+ * full-attn q/k laid out as n_heads contiguous head_dim vectors. */
+static void qk_norm_rope(float *vec, int n_heads, int hd, int rope_dim,
+                         const float *norm_w, int pos, float theta, float eps) {
     for (int h = 0; h < n_heads; h++) {
         float *vh = vec + (size_t)h * hd;
         ot_rmsnorm(vh, norm_w, vh, hd, eps);
-        ot_rope_inplace(vh, hd, pos, theta);
+        ot_rope_partial(vh, hd, rope_dim, pos, theta);
     }
+}
+
+/* gated-delta-net decay: alpha = exp(-exp(A_log) * softplus(a_in + dt_bias)). */
+static float delta_decay(float a_in, float A_log, float dt_bias) {
+    return expf(-expf(A_log) * ot_softplus(a_in + dt_bias));
+}
+
+/* Split the gated attn_q projection [n_heads*(2*hd)] into contiguous queries
+ * q[n_heads*hd] and gates g[n_heads*hd] (head h: [q(hd)|gate(hd)]). When the
+ * model is not output-gated, q is just a copy and g is left untouched. */
+static void split_q_gate(const ornith_arch *a, const float *qproj,
+                         float *q, float *g) {
+    int nh = a->num_attn_heads, hd = a->head_dim;
+    if (!a->attn_output_gate) {
+        memcpy(q, qproj, (size_t)nh * hd * sizeof(float));
+        return;
+    }
+    for (int h = 0; h < nh; h++) {
+        const float *src = qproj + (size_t)h * 2 * hd;
+        memcpy(q + (size_t)h * hd, src,      (size_t)hd * sizeof(float));
+        memcpy(g + (size_t)h * hd, src + hd, (size_t)hd * sizeof(float));
+    }
+}
+
+/* Apply the output gate o_h *= sigmoid(gate_h) elementwise per query head. */
+static void apply_out_gate(const ornith_arch *a, float *o, const float *g) {
+    if (!a->attn_output_gate) return;
+    int n = a->num_attn_heads * a->head_dim;
+    for (int i = 0; i < n; i++) o[i] *= ot_sigmoid(g[i]);
 }
 
 /* Gated delta-net output post-processing for one token: per-head RMSNorm of the
@@ -298,20 +339,24 @@ static void full_attn_decode(const of_model *m, const of_layer *ly,
                              of_state *s, int L, const float *xn, float *x_acc) {
     const ornith_arch *a = &m->a;
     int H=a->hidden_size, nh=a->num_attn_heads, nkv=a->num_kv_heads, hd=a->head_dim;
+    float *qproj = malloc((size_t)full_qproj(a)*sizeof(float));
     float *q = malloc((size_t)full_qdim(a)*sizeof(float));
+    float *g = malloc((size_t)full_qdim(a)*sizeof(float));
     float *k = malloc((size_t)full_kvdim(a)*sizeof(float));
     float *v = malloc((size_t)full_kvdim(a)*sizeof(float));
-    ot_linear(ly->wq, xn, q, full_qdim(a), H);
+    ot_linear(ly->wq, xn, qproj, full_qproj(a), H);
     ot_linear(ly->wk, xn, k, full_kvdim(a), H);
     ot_linear(ly->wv, xn, v, full_kvdim(a), H);
-    qk_norm_rope(q, nh, hd, ly->q_norm, s->pos, a->rope_theta, a->rms_norm_eps);
-    qk_norm_rope(k, nkv, hd, ly->k_norm, s->pos, a->rope_theta, a->rms_norm_eps);
+    split_q_gate(a, qproj, q, g);
+    qk_norm_rope(q, nh, hd, a->rope_dim, ly->q_norm, s->pos, a->rope_theta, a->rms_norm_eps);
+    qk_norm_rope(k, nkv, hd, a->rope_dim, ly->k_norm, s->pos, a->rope_theta, a->rms_norm_eps);
     float *o = malloc((size_t)full_qdim(a)*sizeof(float));
     ornith_gqa_step(&s->kv[L], q, k, v, nh, o, 0.0f);
+    apply_out_gate(a, o, g);
     float *outp = malloc((size_t)H*sizeof(float));
     ot_linear(ly->wo, o, outp, H, full_qdim(a));
     ot_add_(x_acc, outp, H);
-    free(q); free(k); free(v); free(o); free(outp);
+    free(qproj); free(q); free(g); free(k); free(v); free(o); free(outp);
 }
 
 static void linear_attn_decode(const of_model *m, const of_layer *ly,
@@ -330,23 +375,27 @@ static void linear_attn_decode(const of_model *m, const of_layer *ly,
     ot_silu_(conv, Cc);
     float *q = conv, *k = conv+qd, *v = conv+2*qd;
 
-    float *gate_a = malloc((size_t)nv*sizeof(float));
-    float *gate_b = malloc((size_t)nv*sizeof(float));
-    ot_linear(ly->la, xn, gate_a, nv, H);
-    ot_linear(ly->lb, xn, gate_b, nv, H);
+    float *a_in = malloc((size_t)nv*sizeof(float));
+    float *b_in = malloc((size_t)nv*sizeof(float));
+    ot_linear(ly->la, xn, a_in, nv, H);
+    ot_linear(ly->lb, xn, b_in, nv, H);
 
     float *o_all = malloc((size_t)vd*sizeof(float));
     float *knorm = malloc((size_t)dk*sizeof(float));
+    float *qnorm = malloc((size_t)dk*sizeof(float));
     for (int hv = 0; hv < nv; hv++) {
         int kh = hv / group;
-        ot_l2normalize(k + (size_t)kh*dk, knorm, dk, 1e-6f);
+        ot_l2norm_eps(k + (size_t)kh*dk, knorm, dk, 1e-6f);
+        ot_l2norm_eps(q + (size_t)kh*dk, qnorm, dk, 1e-6f);
+        float alpha = delta_decay(a_in[hv], ly->ssm_a[hv], ly->ssm_dt[hv]);
         ornith_delta_state st = { s->delta_S[L] + (size_t)hv*dv*dk, dk, dv };
-        ornith_delta_step(&st, q + (size_t)kh*dk, knorm, v + (size_t)hv*dv,
-                          ot_sigmoid(gate_a[hv]), ot_sigmoid(gate_b[hv]),
+        ornith_delta_step(&st, qnorm, knorm, v + (size_t)hv*dv,
+                          alpha, ot_sigmoid(b_in[hv]),
                           o_all + (size_t)hv*dv);
     }
     delta_finish(m, ly, xn, o_all, x_acc);
-    free(cat); free(conv); free(gate_a); free(gate_b); free(o_all); free(knorm);
+    free(cat); free(conv); free(a_in); free(b_in);
+    free(o_all); free(knorm); free(qnorm);
 }
 
 ornith_status of_forward_decode(const of_model *m, of_state *s,
@@ -387,18 +436,21 @@ static void full_attn_prefill(const of_model *m, const of_layer *ly,
                               float *X_acc) {
     const ornith_arch *a = &m->a;
     int H=a->hidden_size, nh=a->num_attn_heads, nkv=a->num_kv_heads, hd=a->head_dim;
-    int qd=full_qdim(a), kvd=full_kvdim(a);
+    int qd=full_qdim(a), qp=full_qproj(a), kvd=full_kvdim(a);
+    float *QP= malloc((size_t)T*qp*sizeof(float));
     float *Q = malloc((size_t)T*qd*sizeof(float));
+    float *G = malloc((size_t)T*qd*sizeof(float));
     float *K = malloc((size_t)T*kvd*sizeof(float));
     float *Vv= malloc((size_t)T*kvd*sizeof(float));
-    ot_linear_batch(ly->wq, XN, Q, T, qd, H);
+    ot_linear_batch(ly->wq, XN, QP, T, qp, H);
     ot_linear_batch(ly->wk, XN, K, T, kvd, H);
     ot_linear_batch(ly->wv, XN, Vv,T, kvd, H);
     for (int t = 0; t < T; t++) {
         int pos = s->pos + t;
-        qk_norm_rope(Q + (size_t)t*qd, nh, hd, ly->q_norm, pos,
+        split_q_gate(a, QP + (size_t)t*qp, Q + (size_t)t*qd, G + (size_t)t*qd);
+        qk_norm_rope(Q + (size_t)t*qd, nh, hd, a->rope_dim, ly->q_norm, pos,
                      a->rope_theta, a->rms_norm_eps);
-        qk_norm_rope(K + (size_t)t*kvd, nkv, hd, ly->k_norm, pos,
+        qk_norm_rope(K + (size_t)t*kvd, nkv, hd, a->rope_dim, ly->k_norm, pos,
                      a->rope_theta, a->rms_norm_eps);
     }
     /* fresh prefill assumes empty cache (pos==0); fill cache and attend. */
@@ -409,12 +461,13 @@ static void full_attn_prefill(const of_model *m, const of_layer *ly,
     memcpy(s->kv[L].V, Vv,(size_t)T*kvd*sizeof(float));
     s->kv[L].len = T;
     for (int t = 0; t < T; t++) {
+        apply_out_gate(a, O + (size_t)t*qd, G + (size_t)t*qd);
         float *outp = malloc((size_t)H*sizeof(float));
         ot_linear(ly->wo, O + (size_t)t*qd, outp, H, qd);
         ot_add_(X_acc + (size_t)t*H, outp, H);
         free(outp);
     }
-    free(Q); free(K); free(Vv); free(O);
+    free(QP); free(Q); free(G); free(K); free(Vv); free(O);
 }
 
 static void linear_attn_prefill(const of_model *m, const of_layer *ly,
@@ -457,10 +510,10 @@ static void linear_attn_prefill(const of_model *m, const of_layer *ly,
             const float *q = CONV + (size_t)t*Cc + kh*dk;
             const float *k = CONV + (size_t)t*Cc + qd + kh*dk;
             const float *v = CONV + (size_t)t*Cc + 2*qd + hv*dv;
-            memcpy(Qh + (size_t)t*dk, q, (size_t)dk*sizeof(float));
-            ot_l2normalize(k, Kh + (size_t)t*dk, dk, 1e-6f);
+            ot_l2norm_eps(q, Qh + (size_t)t*dk, dk, 1e-6f);
+            ot_l2norm_eps(k, Kh + (size_t)t*dk, dk, 1e-6f);
             memcpy(Vh + (size_t)t*dv, v, (size_t)dv*sizeof(float));
-            al[t] = ot_sigmoid(A[(size_t)t*nv + hv]);
+            al[t] = delta_decay(A[(size_t)t*nv + hv], ly->ssm_a[hv], ly->ssm_dt[hv]);
             be[t] = ot_sigmoid(B[(size_t)t*nv + hv]);
         }
         ornith_delta_state st = { s->delta_S[L] + (size_t)hv*dv*dk, dk, dv };

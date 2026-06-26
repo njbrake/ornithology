@@ -67,6 +67,8 @@ void ot_softmax(float *x, int n);
 void ot_silu_(float *x, int n);
 float ot_silu1(float x);
 float ot_sigmoid(float x);
+/* softplus(x) = log(1 + e^x), numerically stable for large x. */
+float ot_softplus(float x);
 /* SwiGLU: out[i] = SiLU(gate[i]) * up[i]. out may alias gate or up. */
 void ot_swiglu(const float *gate, const float *up, float *out, int n);
 
@@ -77,11 +79,19 @@ void ot_scale_(float *x, float s, int n);                   /* x  *= s         *
 void ot_mul_(float *acc, const float *x, int n);            /* acc *= x (elt)  */
 float ot_dot(const float *a, const float *b, int n);
 float ot_l2norm(const float *x, int n);
-void  ot_l2normalize(const float *x, float *out, int n, float eps); /* x/||x|| */
+void  ot_l2normalize(const float *x, float *out, int n, float eps); /* x/(||x||+eps) */
+/* out = x * rsqrt(sum(x^2) + eps) (the HF/Qwen "l2norm" used on q,k heads). */
+void  ot_l2norm_eps(const float *x, float *out, int n, float eps);
 
 /* RoPE (rotary position embedding), NeoX/HF "rotate-half" convention.
  * Rotates a single head vector `v` of length head_dim in place, at integer
  * position `pos`, using base frequency `theta`. head_dim must be even. */
 void ot_rope_inplace(float *v, int head_dim, int pos, float theta);
+
+/* Partial RoPE: rotates only the first `rotary_dim` of `head_dim` dimensions
+ * (pairs (i, i+rotary_dim/2), HF/Qwen partial_rotary_factor convention); the
+ * remaining [rotary_dim, head_dim) dimensions pass through unchanged. With
+ * rotary_dim == head_dim this is identical to ot_rope_inplace. */
+void ot_rope_partial(float *v, int head_dim, int rotary_dim, int pos, float theta);
 
 #endif /* ORNITH_TENSOR_H */

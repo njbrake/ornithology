@@ -43,23 +43,27 @@ void ornith_ffn_swiglu(const float *Wg, const float *Wu, const float *Wd,
 void ornith_moe_forward(const ornith_moe *m, const float *x, float *out,
                         float *scratch) {
     int H = m->hidden, I = m->inter, K = m->top_k;
-    float *logits = malloc((size_t)m->n_experts * sizeof(float));
-    int   *idx    = malloc((size_t)K * sizeof(int));
-    float *w      = malloc((size_t)K * sizeof(float));
     float *epart  = scratch;                 /* [hidden] expert output        */
     float *ffn_sc = scratch + H;             /* [2*max(inter,shared_inter)]   */
 
-    ot_linear(m->w_router, x, logits, m->n_experts, H);
-    ornith_moe_route(logits, m->n_experts, K, idx, w);
-
     memset(out, 0, (size_t)H * sizeof(float));
-    for (int s = 0; s < K; s++) {
-        int e = idx[s];
-        const float *Wg = m->w_gate + (size_t)e * I * H;
-        const float *Wu = m->w_up   + (size_t)e * I * H;
-        const float *Wd = m->w_down + (size_t)e * H * I;
-        ornith_ffn_swiglu(Wg, Wu, Wd, x, epart, H, I, ffn_sc);
-        ot_addscaled_(out, epart, w[s], H);
+
+    /* Routed experts (skipped entirely for a dense model: n_experts/top_k 0). */
+    if (m->n_experts > 0 && K > 0 && m->w_router) {
+        float *logits = malloc((size_t)m->n_experts * sizeof(float));
+        int   *idx    = malloc((size_t)K * sizeof(int));
+        float *w      = malloc((size_t)K * sizeof(float));
+        ot_linear(m->w_router, x, logits, m->n_experts, H);
+        ornith_moe_route(logits, m->n_experts, K, idx, w);
+        for (int s = 0; s < K; s++) {
+            int e = idx[s];
+            const float *Wg = m->w_gate + (size_t)e * I * H;
+            const float *Wu = m->w_up   + (size_t)e * I * H;
+            const float *Wd = m->w_down + (size_t)e * H * I;
+            ornith_ffn_swiglu(Wg, Wu, Wd, x, epart, H, I, ffn_sc);
+            ot_addscaled_(out, epart, w[s], H);
+        }
+        free(logits); free(idx); free(w);
     }
 
     if (m->shared_inter > 0 && m->sw_gate) {
@@ -67,6 +71,4 @@ void ornith_moe_forward(const ornith_moe *m, const float *x, float *out,
                           H, m->shared_inter, ffn_sc);
         ot_add_(out, epart, H);
     }
-
-    free(logits); free(idx); free(w);
 }

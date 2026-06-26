@@ -75,7 +75,7 @@ cuda-spark: $(CORE_OBJ) $(CLI)
 
 # Test suite (CPU only). Each test file is its own binary; all must pass.
 # GOLDEN_TOP_TOKEN pins the tiny-model regression output (see test_forward.c).
-GOLDEN_TOP_TOKEN ?= 4
+GOLDEN_TOP_TOKEN ?= 9
 TESTS := test_gguf test_quant test_tensor test_attn test_moe test_forward
 
 test: $(CORE_OBJ)
