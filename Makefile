@@ -68,10 +68,22 @@ ornith: $(CORE_OBJ) $(CLI)
 cpu: ornith
 
 # macOS Metal — primary inference backend (compiles only on macOS).
-metal: $(CORE_OBJ) $(CLI)
+#
+# The Metal backend lives in src/ornith_metal.m (Objective-C + embedded MSL,
+# all gated behind ORNITH_BACKEND_METAL). We compile the .m to its own object
+# first (so the `-x objective-c` dialect flag does not bleed onto the C sources
+# or precompiled objects in the link step), then link with the GPU frameworks.
+# The core objects are backend-agnostic and reused as-is; the CLI is rebuilt
+# with -DORNITH_BACKEND_METAL so any metal-guarded paths there activate.
+METAL_OBJ := $(BUILD)/ornith_metal.o
+
+$(METAL_OBJ): $(SRC_DIR)/ornith_metal.m $(SRC_DIR)/ornith_metal.h | $(BUILD)
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -DORNITH_BACKEND_METAL \
-	  -x objective-c $(SRC_DIR)/ornith_metal.m \
-	  $(CORE_OBJ) $(CLI) $(LDFLAGS) \
+	  -x objective-c -fno-objc-arc -c $(SRC_DIR)/ornith_metal.m -o $@
+
+metal: $(CORE_OBJ) $(METAL_OBJ) $(CLI)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -DORNITH_BACKEND_METAL \
+	  $(METAL_OBJ) $(CORE_OBJ) $(CLI) $(LDFLAGS) \
 	  -framework Metal -framework Foundation -framework Accelerate \
 	  $(LIBS) -o ornith
 
