@@ -14,6 +14,7 @@
 #include "ornith.h"
 #include "ornith_model.h"
 #include "ornith_tokenizer.h"
+#include "ornith_sample.h"
 #include <stdio.h>
 
 typedef struct rmodel rmodel;
@@ -30,6 +31,11 @@ const otokenizer  *rmodel_tokenizer(const rmodel *m);
  * streaming detokenized text to `out`. Stops early on EOS. */
 ornith_status rmodel_generate(rmodel *m, const char *prompt, int n_predict,
                               FILE *out);
+
+/* Same as rmodel_generate but with a sampler config (temperature / top-k /
+ * top-p / min-p / repeat-penalty / seed). Pass `sp == NULL` for greedy. */
+ornith_status rmodel_generate_s(rmodel *m, const char *prompt, int n_predict,
+                                const osample_params *sp, FILE *out);
 
 /* The model id: general.name from the GGUF if present, else NULL. */
 const char *rmodel_name(const rmodel *m);
@@ -49,5 +55,18 @@ ornith_status rmodel_generate_ids(rmodel *m,
                                   void (*on_token)(int32_t id, const char *piece,
                                                    void *ud),
                                   void *ud, int *out_finish);
+
+/* Same as rmodel_generate_ids but with a sampler config (temperature / top-k /
+ * top-p / min-p / repeat-penalty / seed). Pass `sp == NULL` for greedy, which is
+ * identical to rmodel_generate_ids. A recent-token window (seeded with the
+ * prompt and grown with each emitted token) drives the repeat penalty. */
+ornith_status rmodel_generate_ids_s(rmodel *m,
+                                    const int32_t *prompt_ids, int n_prompt,
+                                    int n_predict,
+                                    const int32_t *stop_ids, int n_stop,
+                                    const osample_params *sp,
+                                    void (*on_token)(int32_t id,
+                                                     const char *piece, void *ud),
+                                    void *ud, int *out_finish);
 
 #endif /* ORNITH_RFORWARD_H */

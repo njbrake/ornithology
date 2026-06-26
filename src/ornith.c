@@ -285,7 +285,8 @@ static int cmd_run(const char *path) {
 
 /* Real-weight generation: load the GGUF, dequantize on the fly, and greedily
  * decode `n_predict` tokens after the prompt. This is the coherent-text path. */
-static int cmd_generate(const char *path, const char *prompt, int n_predict) {
+static int cmd_generate(const char *path, const char *prompt, int n_predict,
+                        const osample_params *sp) {
     rmodel *m = NULL;
     ornith_status s = rmodel_load(path, &m);
     if (s != ORNITH_OK) {
@@ -297,9 +298,17 @@ static int cmd_generate(const char *path, const char *prompt, int n_predict) {
             "loaded %s: hidden %d, %d layers (%d full-attn), vocab %d, "
             "eos %d\n", path, a->hidden_size, a->num_layers,
             ornith_count_full_attn_layers(a), a->vocab_size, a->eos_token_id);
-    fprintf(stderr, "generating %d tokens (greedy)...\n\n", n_predict);
+    int sampling = sp && sp->temperature > 0.0f;
+    if (sampling)
+        fprintf(stderr, "generating %d tokens (temp %.3g, top-k %d, top-p %.3g, "
+                "min-p %.3g, repeat %.3g, seed %llu)...\n\n", n_predict,
+                (double)sp->temperature, sp->top_k, (double)sp->top_p,
+                (double)sp->min_p, (double)sp->repeat_penalty,
+                (unsigned long long)sp->seed);
+    else
+        fprintf(stderr, "generating %d tokens (greedy)...\n\n", n_predict);
 
-    s = rmodel_generate(m, prompt, n_predict, stdout);
+    s = rmodel_generate_s(m, prompt, n_predict, sampling ? sp : NULL, stdout);
     if (s != ORNITH_OK)
         fprintf(stderr, "run: generation failed: %s\n", ornith_last_error());
     rmodel_free(m);
@@ -315,9 +324,11 @@ static void usage(const char *argv0) {
         "  %s config <config.json>\n"
         "  %s inspect [--tensors] <model.gguf>\n"
         "  %s quantize [--base TYPE] <in.gguf> <out.gguf>\n"
-        "  %s run [--prompt TEXT] [-n N] <model.gguf>\n"
-        "        with --prompt: real-weight greedy generation (default N=32);\n"
-        "        without: inspect + dequant check + synthetic self-test\n"
+        "  %s run [--prompt TEXT] [-n N] [--temp T] [--top-p P] [--top-k K]\n"
+        "         [--min-p M] [--repeat-penalty R] [--seed S] <model.gguf>\n"
+        "        with --prompt: real-weight generation (default N=32);\n"
+        "        default greedy (--temp 0); --temp>0 enables sampling;\n"
+        "        without --prompt: inspect + dequant check + synthetic self-test\n"
         "  %s serve [--host H] [--port P] <model.gguf>\n"
         "        OpenAI/Anthropic-compatible HTTP server (default 127.0.0.1:8080)\n"
         "\n"
@@ -367,14 +378,27 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "run")) {
         const char *path = NULL, *prompt = NULL;
         int n_predict = 32;
+        osample_params sp = osample_params_default();  /* greedy by default */
         for (int i = 2; i < argc; i++) {
             if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
             else if ((!strcmp(argv[i], "-n") || !strcmp(argv[i], "--n-predict"))
                      && i + 1 < argc) n_predict = atoi(argv[++i]);
+            else if ((!strcmp(argv[i], "--temp") || !strcmp(argv[i], "--temperature"))
+                     && i + 1 < argc) sp.temperature = (float)atof(argv[++i]);
+            else if (!strcmp(argv[i], "--top-p") && i + 1 < argc)
+                sp.top_p = (float)atof(argv[++i]);
+            else if (!strcmp(argv[i], "--top-k") && i + 1 < argc)
+                sp.top_k = atoi(argv[++i]);
+            else if (!strcmp(argv[i], "--min-p") && i + 1 < argc)
+                sp.min_p = (float)atof(argv[++i]);
+            else if (!strcmp(argv[i], "--repeat-penalty") && i + 1 < argc)
+                sp.repeat_penalty = (float)atof(argv[++i]);
+            else if (!strcmp(argv[i], "--seed") && i + 1 < argc)
+                sp.seed = (uint64_t)strtoull(argv[++i], NULL, 10);
             else path = argv[i];
         }
         if (!path) { usage(argv[0]); return 1; }
-        if (prompt) return cmd_generate(path, prompt, n_predict);
+        if (prompt) return cmd_generate(path, prompt, n_predict, &sp);
         return cmd_run(path);   /* no prompt: inspect + synthetic self-test */
     }
     if (!strcmp(cmd, "serve")) {

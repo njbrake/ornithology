@@ -42,6 +42,7 @@ CORE := \
   $(SRC_DIR)/ornith_attn.c \
   $(SRC_DIR)/ornith_moe.c \
   $(SRC_DIR)/ornith_tokenizer.c \
+  $(SRC_DIR)/ornith_sample.c \
   $(SRC_DIR)/ornith_rforward.c \
   $(SRC_DIR)/ornith_forward.c \
   $(SRC_DIR)/ornith_server.c
@@ -89,7 +90,7 @@ cuda-spark: $(CORE_OBJ) $(CLI)
 # GOLDEN_TOP_TOKEN pins the tiny-model regression output (see test_forward.c).
 GOLDEN_TOP_TOKEN ?= 9
 TESTS := test_gguf test_quant test_qdot test_tensor test_attn test_moe \
-         test_forward test_tokenizer test_server
+         test_forward test_tokenizer test_server test_sample
 
 test: $(CORE_OBJ)
 	@set -e; for t in $(TESTS); do \

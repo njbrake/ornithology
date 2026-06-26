@@ -26,6 +26,7 @@
 #define ORNITH_SERVER_H
 
 #include "ornith_json.h"
+#include "ornith_sample.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -48,8 +49,10 @@ void chat_msgs_init(chat_msgs *m);
 void chat_msgs_add(chat_msgs *m, const char *role, const char *content);
 void chat_msgs_free(chat_msgs *m);
 
-/* Sampling/request options shared by all three protocols. */
-typedef struct { int max_tokens; bool stream; } gen_opts;
+/* Sampling/request options shared by all three protocols. `samp` carries the
+ * sampler config (temperature / top-k / top-p / min-p / repeat-penalty / seed);
+ * it defaults to greedy (temperature 0) unless the client sends those fields. */
+typedef struct { int max_tokens; bool stream; osample_params samp; } gen_opts;
 
 /* ---- pure helpers (unit-tested) --------------------------------------- */
 
