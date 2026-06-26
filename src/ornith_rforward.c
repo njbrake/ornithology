@@ -2,6 +2,7 @@
 #include "ornith_rforward.h"
 #include "ornith_gguf_write.h"
 #include "ornith_quant.h"
+#include "ornith_qdot.h"
 #include "ornith_tensor.h"
 #include "ornith_attn.h"
 #include <stdlib.h>
@@ -86,7 +87,8 @@ static const float *f32(const ogguf_ltensor *t) { return (const float *)t->data;
 
 typedef struct {
     const ogguf_ltensor *W;
-    const float *x;   /* [in] (matvec) or [T*in] (batch) */
+    const float *x;   /* [in] (matvec) or [T*in] (batch) — f32 fallback path  */
+    const oq8k_block *xq; /* Tn columns of Q8_K-quantized x (NULL => f32 path) */
     float *y;         /* [out] or [T*out] */
     int in, out, Tn;  /* Tn columns of x to apply (1 for plain matvec) */
     int o0, o1;
@@ -96,6 +98,22 @@ static void mv_run(mv_job *j) {
     const ogguf_ltensor *W = j->W;
     int in = j->in, Tn = j->Tn;
     size_t rb = oq_row_bytes(W->type, (size_t)in);
+
+    /* Quant-aware integer path: the activation was already quantized to Q8_K
+     * once (per column); dot the quantized weight bytes directly, no f32 row
+     * materialization. */
+    if (j->xq) {
+        size_t nblk = (size_t)in / OQDOT_QK_K;   /* Q8_K blocks per column */
+        for (int o = j->o0; o < j->o1; o++) {
+            const void *wrow = (const uint8_t *)W->data + (size_t)o * rb;
+            for (int t = 0; t < Tn; t++)
+                qdot_vec_dot(W->type, in, &j->y[(size_t)t * j->out + o],
+                             wrow, j->xq + (size_t)t * nblk);
+        }
+        return;
+    }
+
+    /* F32 fallback: dequantize the row (if needed) then float-dot. */
     int is_f32 = (W->type == OGGML_F32);
     float *row = is_f32 ? NULL : malloc((size_t)in * sizeof(float));
     for (int o = j->o0; o < j->o1; o++) {
@@ -118,6 +136,30 @@ static void matmul_batch_q(const rmodel *m, const ogguf_ltensor *W,
                            const float *X, float *Y, int Tn) {
     int in  = (int)W->dims[0];
     int out = (int)W->dims[1];
+
+    /* If we have an integer vec_dot for this weight type, quantize each of the
+     * Tn activation columns to Q8_K ONCE and reuse it across all output rows
+     * (the big win for the per-token lm_head over ~248k rows). Otherwise fall
+     * back to the dequant + f32 dot path. */
+    /* ORNITH_NO_QDOT=1 forces the old dequant + f32-dot path (A/B parity /
+     * logit-delta measurement against the quant-aware integer kernels). */
+    static int qdot_off = -1;
+    if (qdot_off < 0) {
+        const char *e = getenv("ORNITH_NO_QDOT");
+        qdot_off = (e && e[0] == '1') ? 1 : 0;
+    }
+
+    oq8k_block *XQ = NULL;
+    if (!qdot_off && qdot_can(W->type, in)) {
+        size_t nblk = (size_t)in / OQDOT_QK_K;
+        XQ = malloc((size_t)Tn * nblk * sizeof(oq8k_block));
+        if (XQ) {
+            for (int t = 0; t < Tn; t++)
+                qdot_quantize_row_q8_K(X + (size_t)t * in,
+                                       XQ + (size_t)t * nblk, in);
+        }
+    }
+
     int nth = m->nthreads;
     if (nth > out) nth = out;
     if (nth < 1) nth = 1;
@@ -129,12 +171,15 @@ static void matmul_batch_q(const rmodel *m, const ogguf_ltensor *W,
         int o0 = i * per, o1 = o0 + per;
         if (o0 >= out) break;
         if (o1 > out) o1 = out;
-        jobs[n] = (mv_job){ W, X, Y, in, out, Tn, o0, o1 };
+        jobs[n] = (mv_job){ W, X, XQ, Y, in, out, Tn, o0, o1 };
         n++;
     }
-    if (n == 1) { mv_run(&jobs[0]); return; }
-    for (int i = 0; i < n; i++) pthread_create(&th[i], NULL, mv_thread, &jobs[i]);
-    for (int i = 0; i < n; i++) pthread_join(th[i], NULL);
+    if (n == 1) mv_run(&jobs[0]);
+    else {
+        for (int i = 0; i < n; i++) pthread_create(&th[i], NULL, mv_thread, &jobs[i]);
+        for (int i = 0; i < n; i++) pthread_join(th[i], NULL);
+    }
+    free(XQ);
 }
 static void matvec_q(const rmodel *m, const ogguf_ltensor *W,
                      const float *x, float *y) {
@@ -628,6 +673,11 @@ static void rprefill(rmodel *m, rstate *s, const int32_t *toks, int np,
             rforward_token(m, s, toks[i], (i == np - 1) ? logits : NULL);
     } else {
         rforward_prefill(m, s, toks, np, RFWD_PREFILL_CHUNK, logits);
+    }
+    const char *dump = getenv("ORNITH_DUMP_LOGITS");
+    if (dump && logits) {
+        FILE *f = fopen(dump, "wb");
+        if (f) { fwrite(logits, sizeof(float), (size_t)m->a.vocab_size, f); fclose(f); }
     }
     if (prof) {
         clock_gettime(CLOCK_MONOTONIC, &t1);
