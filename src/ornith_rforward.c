@@ -214,16 +214,25 @@ static int lin_qd(const ornith_arch *a){ return a->lin_key_heads*a->lin_key_head
 static int lin_vd(const ornith_arch *a){ return a->lin_value_heads*a->lin_value_head_dim; }
 static int lin_cc_(const ornith_arch *a){ return 2*lin_qd(a)+lin_vd(a); }
 
+/* ORNITH_KV_Q8=1 stores the full-attention KV cache as int8 + per-(token,head)
+ * scale instead of fp32, roughly quartering its footprint (the linear layers'
+ * recurrent state is unaffected). Default (unset/0) keeps the exact fp32 path. */
+static int kv_q8_enabled(void) {
+    const char *e = getenv("ORNITH_KV_Q8");
+    return e && e[0] && e[0] != '0';
+}
+
 static rstate *rstate_new(const ornith_arch *a, int cap) {
     rstate *s = calloc(1, sizeof(*s));
     s->a = a; s->pos = 0;
+    int kv_q8 = kv_q8_enabled();
     s->kv = calloc((size_t)a->num_layers, sizeof(ornith_kv_cache));
     s->conv = calloc((size_t)a->num_layers, sizeof(ornith_conv_state));
     s->delta_S = calloc((size_t)a->num_layers, sizeof(float *));
     int dk=a->lin_key_head_dim, dv=a->lin_value_head_dim, nv=a->lin_value_heads;
     for (int L = 0; L < a->num_layers; L++) {
         if (ornith_layer_is_full_attn(a, L))
-            ornith_kv_init(&s->kv[L], cap, a->num_kv_heads, a->head_dim);
+            ornith_kv_init_ex(&s->kv[L], cap, a->num_kv_heads, a->head_dim, kv_q8);
         else {
             ornith_conv_init(&s->conv[L], a->lin_conv_kernel, lin_cc_(a));
             s->delta_S[L] = calloc((size_t)nv*dv*dk, sizeof(float));
